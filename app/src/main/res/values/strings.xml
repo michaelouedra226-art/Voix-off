@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Voxa Studio</string>
+    <string name="notification_channel_name">Rendu audio</string>
+    <string name="notification_channel_desc">Notifications lorsque la génération de voix off est terminée</string>
+    <string name="notification_audio_ready_title">Audio prêt dans Voxa Studio</string>
+    <string name="notification_audio_ready_body">Votre voix off a été générée et mixée avec succès.</string>
+</resources>

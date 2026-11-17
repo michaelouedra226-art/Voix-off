@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="midnight_bg">#FF070F1E</color>
+    <color name="midnight_surface">#FF0D192E</color>
+    <color name="turquoise_accent">#FF2DD4BF</color>
+    <color name="gold_accent">#FFF59E0B</color>
+</resources>

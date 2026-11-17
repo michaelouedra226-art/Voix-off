@@ -1,0 +1,6 @@
+{
+  "name": "Voxa Studio",
+  "description": "Studio de production de voix off professionnelles avec mise en scène audio, ambiances synthétisées, mixage avec ducking et export WAV/MP3.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

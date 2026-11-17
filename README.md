@@ -1,11 +1,36 @@
-<div align="center">
+# Voxa Studio — Compilation Android & GitHub Actions
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Application Android (Kotlin + Jetpack Compose + Material 3) de production de voix off avec Firebase AI Logic (`Firebase.ai` + App Check).
 
-  <h1>Built with AI Studio</h2>
+## Prérequis techniques
+- **JDK** : 21 (Eclipse Adoptium / Temurin)
+- **Gradle** : 9.3.1 (via le wrapper `./gradlew` inclus)
+- **Android Gradle Plugin** : 9.1.1 (`compileSdk = 36`, `minSdk = 24`, `targetSdk = 36`)
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Compilation automatique sur GitHub Actions
+Le workflow `.github/workflows/android-apk.yml` se déclenche automatiquement sur chaque `push` / `pull_request` vers `main` ou `master`, ainsi que manuellement depuis l'onglet **Actions → Build Android APK → Run workflow**.
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+### Artefacts produits
+1. **`voxa-studio-debug-apk`** (`app/build/outputs/apk/debug/app-debug.apk`) : compilé systématiquement après passage des tests `:app:testDebugUnitTest`, signé avec `debug.keystore` décodé depuis `debug.keystore.base64` (conservant l'empreinte SHA-1 enregistrée pour Firebase App Check).
+2. **`voxa-studio-release-apk`** (`app/build/outputs/apk/release/app-release.apk`) : compilé automatiquement si les secrets de signature Release sont configurés dans **Settings → Secrets and variables → Actions** du dépôt GitHub :
+   - `RELEASE_KEYSTORE_BASE64` : contenu encodé en Base64 de votre keystore `.jks` (contenant l'alias `upload`)
+   - `STORE_PASSWORD` : mot de passe du keystore
+   - `KEY_PASSWORD` : mot de passe de la clé `upload`
 
-</div>
+Pour encoder votre keystore Release en Base64 :
+```bash
+base64 -w 0 my-upload-key.jks
+```
+
+## Commandes locales
+Avant de compiler localement, décodez le keystore debug s'il n'est pas déjà présent :
+```bash
+base64 --decode debug.keystore.base64 > debug.keystore
+```
+
+Exécuter les tests et compiler l'APK Debug :
+```bash
+sh ./gradlew :app:testDebugUnitTest
+sh ./gradlew :app:assembleDebug
+```
+L'APK généré se trouve dans `app/build/outputs/apk/debug/app-debug.apk`.
