@@ -60,16 +60,24 @@ jobs:
       - name: Vérifier la configuration Firebase (google-services.json)
         id: firebase_cfg
         env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
           GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
         run: |
-          if [ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]; then
-            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > app/google-services.json
+          if [ -n "${GOOGLE_SERVICES_JSON:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+            echo "created_from_secret=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n[:space:]' | base64 --decode > app/google-services.json
             echo "created_from_secret=true" >> "$GITHUB_OUTPUT"
           else
             echo "created_from_secret=false" >> "$GITHUB_OUTPUT"
           fi
           if [ ! -f "app/google-services.json" ]; then
-            echo "::error::Fichier app/google-services.json manquant ! Ajoutez app/google-services.json dans le dépôt ou configurez le secret GOOGLE_SERVICES_JSON_BASE64."
+            echo "::error::Fichier app/google-services.json manquant ! Ajoutez le secret GOOGLE_SERVICES_JSON (contenu JSON brut de app/google-services.json) ou GOOGLE_SERVICES_JSON_BASE64 dans Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          if ! python3 -m json.tool app/google-services.json > /dev/null 2>&1; then
+            echo "::error::app/google-services.json n'est pas un JSON valide."
             exit 1
           fi
           if ! grep -q "com.aistudio.voxastudio.qrzmkn" app/google-services.json; then
@@ -141,6 +149,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Nettoyer les keystores temporaires
+      - name: Nettoyer les fichiers sensibles temporaires
         if: always()
-        run: rm -f debug.keystore "${GITHUB_WORKSPACE}/my-upload-key.jks"
+        run: |
+          rm -f debug.keystore "${GITHUB_WORKSPACE}/my-upload-key.jks"
+          if [ "${{ steps.firebase_cfg.outputs.created_from_secret }}" = "true" ]; then
+            rm -f app/google-services.json
+          fi

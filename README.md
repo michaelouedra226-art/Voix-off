@@ -11,7 +11,9 @@ Application Android (Kotlin + Jetpack Compose + Material 3) de production de voi
 Le workflow `.github/workflows/android-apk.yml` se déclenche automatiquement sur chaque `push` / `pull_request` vers `main` ou `master`, ainsi que manuellement depuis l'onglet **Actions → Build Android APK → Run workflow**.
 
 ### Configuration Firebase requise
-Le fichier `app/google-services.json` doit être présent dans le dépôt (avec le client `com.aistudio.voxastudio.qrzmkn`) ou fourni via le secret GitHub Actions `GOOGLE_SERVICES_JSON_BASE64` (`base64 -w 0 app/google-services.json`) pour que Firebase AI Logic et App Check s'initialisent au lancement.
+Lorsque vous poussez le projet vers GitHub depuis AI Studio, le fichier `app/google-services.json` n'est pas toujours inclus dans le dépôt. Pour que GitHub Actions compile l'APK avec Firebase AI Logic et App Check :
+- **Option la plus simple (sans ligne de commande)** : dans AI Studio, ouvrez `app/google-services.json`, copiez tout son contenu JSON, puis créez le secret GitHub Actions **`GOOGLE_SERVICES_JSON`** dans **Settings → Secrets and variables → Actions** avec ce texte JSON collé tel quel.
+- **Ou** utilisez le secret **`GOOGLE_SERVICES_JSON_BASE64`** (`base64 -w 0 app/google-services.json`), ou committez `app/google-services.json` (contenant le client `com.aistudio.voxastudio.qrzmkn`).
 
 ### Artefacts produits
 1. **`voxa-studio-debug-apk`** (`app/build/outputs/apk/debug/app-debug.apk`) : compilé systématiquement après passage des tests `:app:testDebugUnitTest`, signé avec `debug.keystore` décodé depuis `debug.keystore.base64` (conservant l'empreinte SHA-1 enregistrée pour Firebase App Check).
