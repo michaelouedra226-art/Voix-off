@@ -211,6 +211,7 @@ fun LiveGenerationStatusCard(
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f),
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)),
         modifier = modifier.fillMaxWidth()
     ) {
@@ -522,6 +523,7 @@ fun SegmentTimelineCard(
         } else {
             MaterialTheme.colorScheme.surfaceContainer
         },
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(if (isCurrentlyActiveInFinal) 1.5.dp else 1.dp, borderColor),
         modifier = Modifier
             .fillMaxWidth()

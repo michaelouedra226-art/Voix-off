@@ -266,6 +266,7 @@ fun FinalPlayerCard(
                 Surface(
                     shape = RoundedCornerShape(10.dp),
                     color = StudioWarning.copy(alpha = 0.14f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
@@ -298,6 +299,7 @@ fun FinalPlayerCard(
                 Surface(
                     shape = RoundedCornerShape(14.dp),
                     color = MaterialTheme.colorScheme.background.copy(alpha = 0.45f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(

@@ -238,6 +238,7 @@ fun BriefModeScreen(
                 },
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -474,7 +475,8 @@ fun BriefModeScreen(
             state.errorMessage?.let { err ->
                 Surface(
                     shape = RoundedCornerShape(14.dp),
-                    color = StudioError.copy(alpha = 0.14f),
+                    color = StudioError.copy(alpha = 0.16f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     border = BorderStroke(1.dp, StudioError.copy(alpha = 0.55f)),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -486,7 +488,12 @@ fun BriefModeScreen(
                     ) {
                         Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = StudioError)
                         Spacer(Modifier.width(10.dp))
-                        Text(err, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                        Text(
+                            text = err,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f)
+                        )
                         TextButton(onClick = onClearError) {
                             Text("OK")
                         }
@@ -510,7 +517,8 @@ fun BriefModeScreen(
             ) {
                 Text(
                     text = "Générations (${state.generations.size})",
-                    style = MaterialTheme.typography.titleLarge
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onBackground
                 )
                 if (state.parseResult.segments.isNotEmpty()) {
                     val readyCount = state.parseResult.segments.count { seg ->
@@ -638,6 +646,7 @@ fun BriefModeScreen(
                                         onClick = { onRestoreVersion(ver) },
                                         shape = RoundedCornerShape(10.dp),
                                         color = MaterialTheme.colorScheme.background.copy(alpha = 0.5f),
+                                        contentColor = MaterialTheme.colorScheme.onSurface,
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
                                         Row(
@@ -712,7 +721,8 @@ fun BriefModeScreen(
             if (state.generations.isNotEmpty()) {
                 Text(
                     text = "Historique des prises générées",
-                    style = MaterialTheme.typography.titleMedium
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onBackground
                 )
                 state.generations.forEachIndexed { index, record ->
                     GenerationHistoryCard(
@@ -759,6 +769,7 @@ private fun GenerationHistoryCard(
         } else {
             MaterialTheme.colorScheme.surfaceContainer
         },
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(
             1.dp,
             if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
@@ -883,6 +894,7 @@ private fun GenerationHistoryCard(
                 Surface(
                     shape = RoundedCornerShape(10.dp),
                     color = MaterialTheme.colorScheme.background.copy(alpha = 0.5f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
@@ -960,6 +972,7 @@ private fun BriefPlanCard(
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = MaterialTheme.colorScheme.background.copy(alpha = 0.45f),
+                        contentColor = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.padding(10.dp)) {
@@ -990,6 +1003,7 @@ private fun BriefPlanCard(
             Surface(
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.background.copy(alpha = 0.5f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {

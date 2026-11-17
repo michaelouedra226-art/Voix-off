@@ -57,6 +57,26 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Vérifier la configuration Firebase (google-services.json)
+        id: firebase_cfg
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > app/google-services.json
+            echo "created_from_secret=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "created_from_secret=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ ! -f "app/google-services.json" ]; then
+            echo "::error::Fichier app/google-services.json manquant ! Ajoutez app/google-services.json dans le dépôt ou configurez le secret GOOGLE_SERVICES_JSON_BASE64."
+            exit 1
+          fi
+          if ! grep -q "com.aistudio.voxastudio.qrzmkn" app/google-services.json; then
+            echo "::error::app/google-services.json ne contient pas le package com.aistudio.voxastudio.qrzmkn."
+            exit 1
+          fi
+
       - name: Vérifier la signature Release (optionnelle)
         id: release_signing
         env:

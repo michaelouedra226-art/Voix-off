@@ -354,6 +354,7 @@ fun ExpertModeScreen(
         Surface(
             shape = RoundedCornerShape(12.dp),
             color = MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.7f),
+            contentColor = MaterialTheme.colorScheme.onSurface,
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
@@ -405,6 +406,7 @@ fun ExpertModeScreen(
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = TagToneOrange.copy(alpha = 0.14f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     border = BorderStroke(1.dp, TagToneOrange.copy(alpha = 0.45f)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
@@ -444,6 +446,7 @@ fun ExpertModeScreen(
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = diagColor.copy(alpha = 0.13f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     border = BorderStroke(1.dp, diagColor.copy(alpha = 0.5f)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
@@ -509,7 +512,8 @@ fun ExpertModeScreen(
         // Chronologie des segments
         Text(
             text = "Chronologie (${state.parseResult.segments.size} segments)",
-            style = MaterialTheme.typography.titleLarge
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.onBackground
         )
 
         if (state.parseResult.segments.isEmpty()) {

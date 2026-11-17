@@ -10,6 +10,9 @@ Application Android (Kotlin + Jetpack Compose + Material 3) de production de voi
 ## Compilation automatique sur GitHub Actions
 Le workflow `.github/workflows/android-apk.yml` se déclenche automatiquement sur chaque `push` / `pull_request` vers `main` ou `master`, ainsi que manuellement depuis l'onglet **Actions → Build Android APK → Run workflow**.
 
+### Configuration Firebase requise
+Le fichier `app/google-services.json` doit être présent dans le dépôt (avec le client `com.aistudio.voxastudio.qrzmkn`) ou fourni via le secret GitHub Actions `GOOGLE_SERVICES_JSON_BASE64` (`base64 -w 0 app/google-services.json`) pour que Firebase AI Logic et App Check s'initialisent au lancement.
+
 ### Artefacts produits
 1. **`voxa-studio-debug-apk`** (`app/build/outputs/apk/debug/app-debug.apk`) : compilé systématiquement après passage des tests `:app:testDebugUnitTest`, signé avec `debug.keystore` décodé depuis `debug.keystore.base64` (conservant l'empreinte SHA-1 enregistrée pour Firebase App Check).
 2. **`voxa-studio-release-apk`** (`app/build/outputs/apk/release/app-release.apk`) : compilé automatiquement si les secrets de signature Release sont configurés dans **Settings → Secrets and variables → Actions** du dépôt GitHub :

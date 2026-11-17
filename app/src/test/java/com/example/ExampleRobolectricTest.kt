@@ -18,11 +18,30 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import com.example.ai.configureAppCheck
+import com.example.ai.ensureFirebaseAppInitialized
+import com.example.ai.isFirebaseAppReady
+import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseOptions
 import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class ExampleRobolectricTest {
+
+    @Test
+    fun `firebase options and default FirebaseApp initialize cleanly`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val options = FirebaseOptions.fromResource(context)
+        assertTrue(
+            "google_app_id must be present in merged resources (check app/google-services.json)",
+            options != null && options.applicationId.isNotBlank()
+        )
+        assertTrue(ensureFirebaseAppInitialized(context))
+        configureAppCheck(context, null)
+        assertTrue(isFirebaseAppReady(context))
+        assertTrue(FirebaseApp.getApps(context).isNotEmpty())
+    }
 
     @Test
     fun `app name matches Voxa Studio`() {

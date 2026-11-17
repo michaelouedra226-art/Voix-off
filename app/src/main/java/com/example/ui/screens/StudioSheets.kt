@@ -63,6 +63,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.rounded.WarningAmber
+import com.example.ai.isFirebaseAppReady
 import com.example.audio.AudioPlayerEngine
 import com.example.audio.PlaybackState
 import com.example.domain.model.AmbienceCatalog
@@ -76,6 +78,7 @@ import com.example.domain.model.VoiceCatalog
 import com.example.ui.components.EmptyStudioBadge
 import com.example.ui.theme.StudioError
 import com.example.ui.theme.StudioSuccess
+import com.example.ui.theme.StudioWarning
 import com.example.ui.theme.TagAmbienceTurquoise
 import com.example.ui.theme.TagVoiceViolet
 import com.example.ui.theme.ThemeMode
@@ -173,6 +176,7 @@ fun VoicesAndAmbiencesScreen(
                                 shape = RoundedCornerShape(16.dp),
                                 color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
                                 else MaterialTheme.colorScheme.surfaceContainer,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 border = BorderStroke(
                                     1.dp,
                                     if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
@@ -597,6 +601,7 @@ fun ProjectsScreen(
                         shape = RoundedCornerShape(16.dp),
                         color = if (isActive) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
                         else MaterialTheme.colorScheme.surfaceContainer,
+                        contentColor = MaterialTheme.colorScheme.onSurface,
                         border = BorderStroke(
                             1.dp,
                             if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
@@ -677,10 +682,14 @@ fun SettingsAndDictionaryScreen(
         ) {
             // Statut Firebase AI Logic & App Check
             item {
+                val context = LocalContext.current
+                val firebaseReady = remember(context) { isFirebaseAppReady(context) }
+                val statusColor = if (firebaseReady) StudioSuccess else StudioWarning
                 Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = MaterialTheme.colorScheme.surfaceContainer,
-                    border = BorderStroke(1.dp, StudioSuccess.copy(alpha = 0.4f)),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    border = BorderStroke(1.dp, statusColor.copy(alpha = 0.45f)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
@@ -688,15 +697,23 @@ fun SettingsAndDictionaryScreen(
                         modifier = Modifier.padding(14.dp)
                     ) {
                         Icon(
-                            Icons.Rounded.VerifiedUser,
+                            imageVector = if (firebaseReady) Icons.Rounded.VerifiedUser else Icons.Rounded.WarningAmber,
                             contentDescription = null,
-                            tint = StudioSuccess
+                            tint = statusColor
                         )
                         Spacer(Modifier.width(12.dp))
                         Column {
-                            Text("Connexion Gemini via Firebase AI Logic", style = MaterialTheme.typography.titleSmall)
                             Text(
-                                "Authentification sécurisée par App Check (aucune clé API manuelle requise).",
+                                text = if (firebaseReady) "Connexion Gemini via Firebase AI Logic"
+                                else "Configuration Firebase manquante",
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                            Text(
+                                text = if (firebaseReady) {
+                                    "Authentification sécurisée par App Check (aucune clé API manuelle requise)."
+                                } else {
+                                    "Cet APK a été compilé sans app/google-services.json. Ajoutez ce fichier puis recompilez."
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -721,6 +738,7 @@ fun SettingsAndDictionaryScreen(
                                 shape = RoundedCornerShape(12.dp),
                                 color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
                                 else MaterialTheme.colorScheme.background.copy(alpha = 0.4f),
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 border = BorderStroke(
                                     1.dp,
                                     if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant

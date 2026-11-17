@@ -176,6 +176,12 @@ class VoxaAiService(private val context: Context) {
         genderPreference: VoiceGenderPreference,
         preferredModelId: String
     ): BriefPlan {
+        if (!ensureFirebaseAppInitialized(context)) {
+            throw BriefPlanningException(
+                "Configuration Firebase absente dans cet APK (app/google-services.json manquant lors de la compilation). Vérifiez votre dépôt puis recompilez l'APK.",
+                rawText.ifBlank { description }
+            )
+        }
         if (!isNetworkAvailable()) {
             throw BriefPlanningException(
                 "Vous êtes hors ligne. Vérifiez votre connexion Internet puis réessayez.",
@@ -238,6 +244,9 @@ class VoxaAiService(private val context: Context) {
         instruction: String,
         customAmbienceNames: List<String>
     ): Pair<String, String> {
+        if (!ensureFirebaseAppInitialized(context)) {
+            throw IllegalStateException("Configuration Firebase absente dans cet APK (app/google-services.json manquant lors de la compilation).")
+        }
         if (!isNetworkAvailable()) {
             throw IllegalStateException("Vous êtes hors ligne. L'affinage par l'IA nécessite une connexion Internet.")
         }
@@ -288,6 +297,9 @@ class VoxaAiService(private val context: Context) {
         modelId: String,
         languageCode: String
     ): FloatArray {
+        if (!ensureFirebaseAppInitialized(context)) {
+            throw IllegalStateException("Configuration Firebase absente dans cet APK (app/google-services.json manquant lors de la compilation).")
+        }
         if (!isNetworkAvailable()) {
             throw IllegalStateException("Hors ligne : impossible de contacter Gemini TTS.")
         }
@@ -426,6 +438,8 @@ class VoxaAiService(private val context: Context) {
         val raw = e.message.orEmpty()
         val msg = raw.lowercase()
         return when {
+            msg.contains("default firebaseapp is not initialized") || msg.contains("initializeapp(context)") ->
+                "Firebase n'est pas initialisé dans cet APK (fichier app/google-services.json absent lors de la compilation). Vérifiez app/google-services.json et recompilez."
             e is TimeoutCancellationException || msg.contains("timeout") ->
                 "Délai d'attente dépassé (60 s). Réessayez avec un segment plus court ou vérifiez votre connexion."
             !isNetworkAvailable() || msg.contains("unable to resolve host") || msg.contains("network") ->
