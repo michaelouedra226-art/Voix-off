@@ -121,7 +121,7 @@ enum class TtsModelOption(
     GEMINI_3_1_FLASH_TTS(
         modelId = "gemini-3.1-flash-tts-preview",
         labelFr = "Gemini 3.1 Flash TTS (Recommandé)",
-        descriptionFr = "Dernière génération rapide et expressive via Firebase AI Logic"
+        descriptionFr = "Dernière génération rapide et expressive pour voix off studio"
     ),
     GEMINI_2_5_FLASH_TTS(
         modelId = "gemini-2.5-flash-preview-tts",
@@ -386,7 +386,8 @@ data class StudioSettings(
     val hapticsEnabled: Boolean = true,
     val completionSoundEnabled: Boolean = true,
     val pronunciationNormalizationEnabled: Boolean = true,
-    val themeMode: ThemeMode = ThemeMode.DARK
+    val themeMode: ThemeMode = ThemeMode.DARK,
+    val personalGeminiApiKey: String = ""
 )
 
 data class SessionUsage(

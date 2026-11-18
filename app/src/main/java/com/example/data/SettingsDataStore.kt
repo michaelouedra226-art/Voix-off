@@ -33,6 +33,7 @@ class SettingsDataStore(private val context: Context) {
         val RECENT_TONES = stringPreferencesKey("recent_tones")
         val TOTAL_API_CALLS = intPreferencesKey("total_api_calls")
         val TOTAL_CHARS = intPreferencesKey("total_chars_generated")
+        val PERSONAL_GEMINI_API_KEY = stringPreferencesKey("personal_gemini_api_key")
     }
 
     val settingsFlow: Flow<StudioSettings> = context.voxaDataStore.data.map { prefs ->
@@ -46,7 +47,8 @@ class SettingsDataStore(private val context: Context) {
             pronunciationNormalizationEnabled = prefs[Keys.PRONUNCIATION_NORM] ?: true,
             themeMode = prefs[Keys.THEME_MODE]?.let {
                 runCatching { ThemeMode.valueOf(it) }.getOrNull()
-            } ?: ThemeMode.DARK
+            } ?: ThemeMode.DARK,
+            personalGeminiApiKey = (prefs[Keys.PERSONAL_GEMINI_API_KEY] ?: "").trim()
         )
     }
 
@@ -82,7 +84,8 @@ class SettingsDataStore(private val context: Context) {
                 pronunciationNormalizationEnabled = prefs[Keys.PRONUNCIATION_NORM] ?: true,
                 themeMode = prefs[Keys.THEME_MODE]?.let {
                     runCatching { ThemeMode.valueOf(it) }.getOrNull()
-                } ?: ThemeMode.DARK
+                } ?: ThemeMode.DARK,
+                personalGeminiApiKey = (prefs[Keys.PERSONAL_GEMINI_API_KEY] ?: "").trim()
             )
             val updated = transform(current)
             prefs[Keys.DEFAULT_MODEL] = updated.defaultModelId
@@ -93,6 +96,12 @@ class SettingsDataStore(private val context: Context) {
             prefs[Keys.COMPLETION_SOUND] = updated.completionSoundEnabled
             prefs[Keys.PRONUNCIATION_NORM] = updated.pronunciationNormalizationEnabled
             prefs[Keys.THEME_MODE] = updated.themeMode.name
+            val cleanedKey = updated.personalGeminiApiKey.trim()
+            if (cleanedKey.isEmpty()) {
+                prefs.remove(Keys.PERSONAL_GEMINI_API_KEY)
+            } else {
+                prefs[Keys.PERSONAL_GEMINI_API_KEY] = cleanedKey
+            }
         }
     }
 

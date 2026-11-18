@@ -62,8 +62,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.rounded.Key
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
 import com.example.ai.isFirebaseAppReady
 import com.example.audio.AudioPlayerEngine
 import com.example.audio.PlaybackState
@@ -651,6 +660,9 @@ fun ProjectsScreen(
 fun SettingsAndDictionaryScreen(
     state: StudioUiState,
     onUpdateSettings: ((StudioSettings) -> StudioSettings) -> Unit,
+    onSavePersonalApiKey: (String) -> Unit,
+    onTestPersonalApiKey: (String) -> Unit,
+    onClearApiKeyTestState: () -> Unit,
     onAddDictionaryEntry: (String, String) -> Unit,
     onDeleteDictionaryEntry: (String) -> Unit,
     onClose: () -> Unit
@@ -660,6 +672,10 @@ fun SettingsAndDictionaryScreen(
     var phoneticInput by remember { mutableStateOf("") }
     var showVoiceMenu by remember { mutableStateOf(false) }
     var showLangMenu by remember { mutableStateOf(false) }
+    var apiKeyInput by remember(state.settings.personalGeminiApiKey) {
+        mutableStateOf(state.settings.personalGeminiApiKey)
+    }
+    var showApiKey by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -680,11 +696,34 @@ fun SettingsAndDictionaryScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Statut Firebase AI Logic & App Check
+            // Statut connexion Gemini (Clé personnelle directe ou Firebase AI Logic & App Check)
             item {
                 val context = LocalContext.current
                 val firebaseReady = remember(context) { isFirebaseAppReady(context) }
-                val statusColor = if (firebaseReady) StudioSuccess else StudioWarning
+                val hasPersonalKey = state.settings.personalGeminiApiKey.isNotBlank()
+                val statusColor = when {
+                    hasPersonalKey -> StudioSuccess
+                    firebaseReady -> StudioSuccess
+                    else -> StudioWarning
+                }
+                val statusIcon = when {
+                    hasPersonalKey -> Icons.Rounded.Key
+                    firebaseReady -> Icons.Rounded.VerifiedUser
+                    else -> Icons.Rounded.WarningAmber
+                }
+                val statusTitle = when {
+                    hasPersonalKey -> "Clé API Gemini personnelle active"
+                    firebaseReady -> "Connexion via Firebase AI Logic"
+                    else -> "Configuration Firebase manquante"
+                }
+                val statusSubtitle = when {
+                    hasPersonalKey ->
+                        "Les requêtes passent directement par l'API Gemini avec votre clé (Firebase App Check contourné). Fonctionne sur tout APK Debug ou Release."
+                    firebaseReady ->
+                        "Authentification via App Check. Si vous rencontrez une erreur 403 sur un APK Debug installé hors d'AI Studio, renseignez votre clé Gemini ci-dessous."
+                    else ->
+                        "Ajoutez votre clé API Gemini personnelle ci-dessous pour utiliser l'application immédiatement, ou recompilez avec app/google-services.json."
+                }
                 Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = MaterialTheme.colorScheme.surfaceContainer,
@@ -697,26 +736,174 @@ fun SettingsAndDictionaryScreen(
                         modifier = Modifier.padding(14.dp)
                     ) {
                         Icon(
-                            imageVector = if (firebaseReady) Icons.Rounded.VerifiedUser else Icons.Rounded.WarningAmber,
+                            imageVector = statusIcon,
                             contentDescription = null,
                             tint = statusColor
                         )
                         Spacer(Modifier.width(12.dp))
-                        Column {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             Text(
-                                text = if (firebaseReady) "Connexion Gemini via Firebase AI Logic"
-                                else "Configuration Firebase manquante",
+                                text = statusTitle,
                                 style = MaterialTheme.typography.titleSmall
                             )
                             Text(
-                                text = if (firebaseReady) {
-                                    "Authentification sécurisée par App Check (aucune clé API manuelle requise)."
-                                } else {
-                                    "Cet APK a été compilé sans app/google-services.json. Ajoutez ce fichier puis recompilez."
-                                },
+                                text = statusSubtitle,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                        }
+                    }
+                }
+            }
+
+            // Clé API Gemini personnelle (optionnelle)
+            item {
+                val savedKey = state.settings.personalGeminiApiKey
+                val trimmedDraft = apiKeyInput.trim()
+                val hasUnsavedChanges = trimmedDraft != savedKey
+                val testState = state.apiKeyTestState
+
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "Clé API Gemini personnelle (optionnelle)",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (savedKey.isNotBlank()) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = StudioSuccess.copy(alpha = 0.16f),
+                                    contentColor = StudioSuccess
+                                ) {
+                                    Text(
+                                        text = "Active",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        Text(
+                            text = "Utile si vous installez l'APK Debug sur téléphone (évite l'erreur App Check 403). Créez une clé gratuite sur Google AI Studio (aistudio.google.com). La clé reste enregistrée uniquement sur cet appareil.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        OutlinedTextField(
+                            value = apiKeyInput,
+                            onValueChange = {
+                                apiKeyInput = it
+                                if (testState.message != null) onClearApiKeyTestState()
+                            },
+                            label = { Text("Clé API Gemini (AIza…)") },
+                            placeholder = { Text("Collez votre clé Google AI Studio") },
+                            singleLine = true,
+                            visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Password,
+                                imeAction = ImeAction.Done
+                            ),
+                            trailingIcon = {
+                                IconButton(
+                                    onClick = { showApiKey = !showApiKey },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("settings_toggle_api_key_visibility")
+                                ) {
+                                    Icon(
+                                        imageVector = if (showApiKey) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                        contentDescription = if (showApiKey) "Masquer la clé API" else "Afficher la clé API"
+                                    )
+                                }
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_gemini_api_key_input")
+                        )
+
+                        if (testState.isTesting || testState.message != null) {
+                            val msgColor = when (testState.isSuccess) {
+                                true -> StudioSuccess
+                                false -> StudioError
+                                null -> MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                if (testState.isTesting) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                }
+                                Text(
+                                    text = testState.message.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = msgColor
+                                )
+                            }
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Button(
+                                onClick = { onSavePersonalApiKey(trimmedDraft) },
+                                enabled = hasUnsavedChanges && !testState.isTesting,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("settings_save_api_key_button")
+                            ) {
+                                Text("Enregistrer")
+                            }
+                            OutlinedButton(
+                                onClick = { onTestPersonalApiKey(trimmedDraft) },
+                                enabled = trimmedDraft.isNotEmpty() && !testState.isTesting,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .height(48.dp)
+                                    .testTag("settings_test_api_key_button")
+                            ) {
+                                Text(if (testState.isTesting) "Test…" else "Tester")
+                            }
+                            if (apiKeyInput.isNotEmpty() || savedKey.isNotEmpty()) {
+                                IconButton(
+                                    onClick = {
+                                        apiKeyInput = ""
+                                        onSavePersonalApiKey("")
+                                    },
+                                    enabled = !testState.isTesting,
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .testTag("settings_clear_api_key_button")
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.DeleteOutline,
+                                        contentDescription = "Effacer la clé API personnelle",
+                                        tint = StudioError
+                                    )
+                                }
+                            }
                         }
                     }
                 }

@@ -18,9 +18,13 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import com.example.ai.GeminiDirectRestClient
+import com.example.ai.GeminiRestHttpException
+import com.example.ai.VoxaAiService
 import com.example.ai.configureAppCheck
 import com.example.ai.ensureFirebaseAppInitialized
 import com.example.ai.isFirebaseAppReady
+import com.example.data.SettingsDataStore
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import java.io.File
@@ -115,5 +119,87 @@ class ExampleRobolectricTest {
         } finally {
             db.close()
         }
+    }
+
+    @Test
+    fun `direct rest client builds valid tts and structured payloads and parses responses`() {
+        val ttsBody = GeminiDirectRestClient.buildTtsRequestBody(
+            actorPrompt = "Bonjour studio",
+            voiceName = "Kore",
+            languageCode = "fr-FR"
+        )
+        val genCfg = ttsBody.getJSONObject("generationConfig")
+        assertEquals("AUDIO", genCfg.getJSONArray("responseModalities").getString(0))
+        val speechCfg = genCfg.getJSONObject("speechConfig")
+        assertEquals("fr-FR", speechCfg.getString("languageCode"))
+        assertEquals(
+            "Kore",
+            speechCfg.getJSONObject("voiceConfig").getJSONObject("prebuiltVoiceConfig").getString("voiceName")
+        )
+
+        val autoLangBody = GeminiDirectRestClient.buildTtsRequestBody(
+            actorPrompt = "Hello",
+            voiceName = "Puck",
+            languageCode = "auto"
+        )
+        assertFalse(
+            autoLangBody.getJSONObject("generationConfig").getJSONObject("speechConfig").has("languageCode")
+        )
+
+        val fakeAudioJson = """
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      { "inlineData": { "mimeType": "audio/L16;rate=24000", "data": "AQIDBA==" } }
+                    ]
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+        assertEquals("AQIDBA==", GeminiDirectRestClient.extractAudioBase64FromResponse(fakeAudioJson))
+
+        val fakeTextJson = """
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [ { "text": "{\"annotatedScript\":\"[voix: Kore] Bonjour\"}" } ]
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+        assertTrue(GeminiDirectRestClient.extractTextFromResponse(fakeTextJson).contains("annotatedScript"))
+
+        val wavBytes = ByteArray(50)
+        wavBytes[0] = 'R'.code.toByte(); wavBytes[1] = 'I'.code.toByte()
+        wavBytes[2] = 'F'.code.toByte(); wavBytes[3] = 'F'.code.toByte()
+        wavBytes[8] = 'W'.code.toByte(); wavBytes[9] = 'A'.code.toByte()
+        wavBytes[10] = 'V'.code.toByte(); wavBytes[11] = 'E'.code.toByte()
+        assertEquals(6, GeminiDirectRestClient.stripWavHeaderIfPresent(wavBytes).size)
+    }
+
+    @Test
+    fun `personal gemini api key persists trimmed and rest errors translate without app check confusion`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val store = SettingsDataStore(context)
+
+        store.updateSettings { it.copy(personalGeminiApiKey = "  AIzaTestKey123  ") }
+        assertEquals("AIzaTestKey123", store.settingsFlow.first().personalGeminiApiKey)
+
+        store.updateSettings { it.copy(personalGeminiApiKey = "") }
+        assertEquals("", store.settingsFlow.first().personalGeminiApiKey)
+
+        val service = VoxaAiService(context)
+        val parsedErr = GeminiDirectRestClient.parseErrorResponse(
+            400,
+            """{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"""
+        )
+        val readable = service.translateAiError(parsedErr, usingPersonalKey = true)
+        assertTrue(readable.contains("Clé API Gemini", ignoreCase = true))
+        assertFalse(readable.contains("App Check", ignoreCase = true))
     }
 }

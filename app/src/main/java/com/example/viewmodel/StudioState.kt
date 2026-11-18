@@ -41,6 +41,12 @@ data class UndoDeletedProject(
     val project: ProjectItem
 )
 
+data class ApiKeyTestState(
+    val isTesting: Boolean = false,
+    val isSuccess: Boolean? = null,
+    val message: String? = null
+)
+
 data class StudioUiState(
     val activeProjectId: String = "",
     val projectTitle: String = "",
@@ -112,5 +118,6 @@ data class StudioUiState(
     val voicePreviewError: String? = null,
     val abTestPhrase: String = "",
     val abSlotA: AbTestSlot = AbTestSlot(voiceName = "Kore", tone = "chaleureux"),
-    val abSlotB: AbTestSlot = AbTestSlot(voiceName = "Charon", tone = "sérieux")
+    val abSlotB: AbTestSlot = AbTestSlot(voiceName = "Charon", tone = "sérieux"),
+    val apiKeyTestState: ApiKeyTestState = ApiKeyTestState()
 )

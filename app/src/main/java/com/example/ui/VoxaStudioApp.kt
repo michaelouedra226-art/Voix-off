@@ -213,6 +213,9 @@ fun VoxaStudioApp(
                     SettingsAndDictionaryScreen(
                         state = state,
                         onUpdateSettings = viewModel::updateSettings,
+                        onSavePersonalApiKey = viewModel::savePersonalGeminiApiKey,
+                        onTestPersonalApiKey = viewModel::testPersonalGeminiApiKey,
+                        onClearApiKeyTestState = viewModel::clearApiKeyTestState,
                         onAddDictionaryEntry = viewModel::addPronunciationEntry,
                         onDeleteDictionaryEntry = viewModel::deletePronunciationEntry,
                         onClose = { activeOverlay = StudioOverlay.NONE }

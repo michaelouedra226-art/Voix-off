@@ -470,7 +470,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     targetDuration = state.targetDuration,
                     languageLabel = langLabel,
                     genderPreference = state.genderPreference,
-                    preferredModelId = state.selectedModelId
+                    preferredModelId = state.selectedModelId,
+                    apiKey = state.settings.personalGeminiApiKey
                 )
 
                 _uiState.update {
@@ -510,7 +511,10 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     it.copy(
                         isPlanningBrief = false,
                         generationPhase = GenerationPhase.IDLE,
-                        errorMessage = aiService.translateAiError(e)
+                        errorMessage = aiService.translateAiError(
+                            e,
+                            usingPersonalKey = state.settings.personalGeminiApiKey.isNotBlank()
+                        )
                     )
                 }
             }
@@ -575,7 +579,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 val (updatedScript, explanation) = aiService.refineAnnotatedScript(
                     currentScript = state.expertScript,
                     instruction = instruction,
-                    customAmbienceNames = state.customAmbiences.map { it.name }
+                    customAmbienceNames = state.customAmbiences.map { it.name },
+                    apiKey = state.settings.personalGeminiApiKey
                 )
                 updateExpertScript(updatedScript, updatedScript.length)
                 saveNamedVersion("Affinage : ${instruction.take(28)}")
@@ -735,7 +740,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     speed = seg.speed,
                     activeAmbience = seg.activeAmbience,
                     modelId = _uiState.value.selectedModelId,
-                    languageCode = effectiveLang
+                    languageCode = effectiveLang,
+                    apiKey = _uiState.value.settings.personalGeminiApiKey
                 )
                 val take = repository.saveSegmentTakeToDisk(fp, samples, saveAsPrimaryCache = true)
                 settingsStore.incrementUsage(normalizedText.length)
@@ -980,7 +986,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     speed = seg.speed,
                     activeAmbience = seg.activeAmbience,
                     modelId = _uiState.value.selectedModelId,
-                    languageCode = effectiveLang
+                    languageCode = effectiveLang,
+                    apiKey = _uiState.value.settings.personalGeminiApiKey
                 )
                 val newTake = repository.saveSegmentTakeToDisk(
                     fingerprint = fp,
@@ -1065,11 +1072,19 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     speed = com.example.domain.model.SpeechSpeed.NORMAL,
                     activeAmbience = null,
                     modelId = st.selectedModelId,
-                    languageCode = resolveEffectiveLanguageCode(cleaned)
+                    languageCode = resolveEffectiveLanguageCode(cleaned),
+                    apiKey = st.settings.personalGeminiApiKey
                 )
                 playerEngine.playSamplesOnce("passage", samples)
             } catch (e: Exception) {
-                _uiState.update { it.copy(errorMessage = aiService.translateAiError(e)) }
+                _uiState.update {
+                    it.copy(
+                        errorMessage = aiService.translateAiError(
+                            e,
+                            usingPersonalKey = _uiState.value.settings.personalGeminiApiKey.isNotBlank()
+                        )
+                    )
+                }
             }
         }
     }
@@ -1150,7 +1165,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         speed = com.example.domain.model.SpeechSpeed.NORMAL,
                         activeAmbience = null,
                         modelId = _uiState.value.selectedModelId,
-                        languageCode = if (lang == LanguageOption.AUTO) "fr-FR" else lang.code
+                        languageCode = if (lang == LanguageOption.AUTO) "fr-FR" else lang.code,
+                        apiKey = _uiState.value.settings.personalGeminiApiKey
                     )
                     repository.saveSegmentTakeToDisk(fp, generated, saveAsPrimaryCache = true)
                     settingsStore.incrementUsage(sampleLine.length)
@@ -1158,7 +1174,14 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 playerEngine.playSamplesOnce("voice:$voiceName", samples)
             } catch (e: Exception) {
-                _uiState.update { it.copy(voicePreviewError = aiService.translateAiError(e)) }
+                _uiState.update {
+                    it.copy(
+                        voicePreviewError = aiService.translateAiError(
+                            e,
+                            usingPersonalKey = _uiState.value.settings.personalGeminiApiKey.isNotBlank()
+                        )
+                    )
+                }
             } finally {
                 _uiState.update { it.copy(previewingVoiceName = null) }
             }
@@ -1204,7 +1227,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         speed = com.example.domain.model.SpeechSpeed.NORMAL,
                         activeAmbience = null,
                         modelId = modelId,
-                        languageCode = lang
+                        languageCode = lang,
+                        apiKey = _uiState.value.settings.personalGeminiApiKey
                     )
                     settingsStore.incrementUsage(phrase.length)
                     slot.copy(
@@ -1213,7 +1237,13 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         durationSec = pcm.size.toFloat() / PcmUtils.SAMPLE_RATE
                     )
                 } catch (e: Exception) {
-                    slot.copy(isLoading = false, error = aiService.translateAiError(e))
+                    slot.copy(
+                        isLoading = false,
+                        error = aiService.translateAiError(
+                            e,
+                            usingPersonalKey = _uiState.value.settings.personalGeminiApiKey.isNotBlank()
+                        )
+                    )
                 }
             }
 
@@ -1499,6 +1529,97 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             settingsStore.updateSettings(transform)
         }
+    }
+
+    fun savePersonalGeminiApiKey(rawKey: String) {
+        val cleaned = rawKey.trim()
+        viewModelScope.launch {
+            settingsStore.updateSettings { it.copy(personalGeminiApiKey = cleaned) }
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    voicePreviewError = null,
+                    apiKeyTestState = if (cleaned.isEmpty()) {
+                        ApiKeyTestState(
+                            isTesting = false,
+                            isSuccess = null,
+                            message = "Clé effacée. Mode Firebase AI Logic actif."
+                        )
+                    } else {
+                        ApiKeyTestState(
+                            isTesting = false,
+                            isSuccess = true,
+                            message = "Clé API Gemini enregistrée sur cet appareil."
+                        )
+                    }
+                )
+            }
+            _toastEvents.tryEmit(
+                StudioToastEvent.Info(
+                    if (cleaned.isEmpty()) "Clé personnelle supprimée."
+                    else "Clé API Gemini personnelle activée."
+                )
+            )
+        }
+    }
+
+    fun testPersonalGeminiApiKey(rawKey: String) {
+        val cleaned = rawKey.trim()
+        if (cleaned.isEmpty()) {
+            _uiState.update {
+                it.copy(
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        isSuccess = false,
+                        message = "Collez votre clé API Gemini avant de lancer le test."
+                    )
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = true,
+                        isSuccess = null,
+                        message = "Vérification auprès de Google AI Studio…"
+                    )
+                )
+            }
+            val result = aiService.verifyPersonalApiKey(cleaned)
+            result.fold(
+                onSuccess = { okMsg ->
+                    settingsStore.updateSettings { it.copy(personalGeminiApiKey = cleaned) }
+                    _uiState.update {
+                        it.copy(
+                            errorMessage = null,
+                            voicePreviewError = null,
+                            apiKeyTestState = ApiKeyTestState(
+                                isTesting = false,
+                                isSuccess = true,
+                                message = "$okMsg Clé enregistrée et activée."
+                            )
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            apiKeyTestState = ApiKeyTestState(
+                                isTesting = false,
+                                isSuccess = false,
+                                message = err.message ?: "Impossible de valider cette clé."
+                            )
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun clearApiKeyTestState() {
+        _uiState.update { it.copy(apiKeyTestState = ApiKeyTestState()) }
     }
 
     fun showInfoMessage(message: String) {
