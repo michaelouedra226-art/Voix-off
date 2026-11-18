@@ -447,7 +447,11 @@ class VoxaAiService(private val context: Context) {
             msg.contains("429") || msg.contains("quota") || msg.contains("resource_exhausted") ->
                 "Quota Gemini temporairement atteint (429). Patientez quelques instants avant de relancer la génération."
             msg.contains("403") || msg.contains("app check") || msg.contains("attestation") ->
-                "Accès refusé par Firebase App Check (403). Vérifiez la configuration Firebase du projet ou relancez l'application."
+                if (com.example.BuildConfig.DEBUG) {
+                    "Accès refusé par Firebase App Check (403). Un APK Debug lancé hors de l'émulateur AI Studio ne dispose pas du jeton d'attestation de test ; lancez l'aperçu dans AI Studio ou utilisez la version Release."
+                } else {
+                    "Accès refusé par Firebase App Check (403). Vérifiez la connexion réseau, l'heure de l'appareil et la configuration reCAPTCHA du projet."
+                }
             msg.contains("401") || msg.contains("unauthenticated") || msg.contains("api key") ->
                 "Authentification refusée par le service Gemini. Vérifiez l'activation de Firebase AI Logic."
             msg.contains("404") || msg.contains("not found") ->

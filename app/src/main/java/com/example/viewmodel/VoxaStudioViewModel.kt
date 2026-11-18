@@ -771,10 +771,11 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         status = SegmentStatus.ERROR,
                         errorMessage = msg
                     )
+                    val cleanMsg = msg.trimEnd('.', ' ')
                     st.copy(
                         segmentStates = map,
                         generationPhase = GenerationPhase.IDLE,
-                        errorMessage = "Segment ${idx + 1} sur ${segments.size} en erreur : $msg. Touchez « Reprendre » pour continuer sans perdre les segments déjà prêts."
+                        errorMessage = "Segment ${idx + 1} sur ${segments.size} en erreur : $cleanMsg. Touchez « Reprendre » pour continuer sans perdre les segments déjà prêts."
                     )
                 }
                 break
