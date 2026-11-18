@@ -51,13 +51,19 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.rounded.Subtitles
 import com.example.audio.AudioExportFormat
-import com.example.domain.model.AudioMetrics
 import com.example.audio.PlaybackState
+import com.example.domain.model.AudioMetrics
+import com.example.domain.model.LoudnessTarget
 import com.example.domain.model.MixConfig
+import com.example.domain.model.ReverbPreset
 import com.example.ui.theme.StudioSuccess
 import com.example.ui.theme.StudioWarning
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -77,6 +83,7 @@ fun FinalPlayerCard(
     onUpdateMixConfig: ((MixConfig) -> MixConfig) -> Unit,
     onExport: (AudioExportFormat, Boolean) -> Unit,
     onShare: (AudioExportFormat, Boolean) -> Unit,
+    onExportSrt: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var showMixSliders by remember { mutableStateOf(false) }
@@ -339,6 +346,70 @@ fun FinalPlayerCard(
                             range = 0.3f..3.0f,
                             onChange = { v -> onUpdateMixConfig { it.copy(fadeDurationSec = v) } }
                         )
+
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Post-traitement & Montage rapide",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+
+                        MixSliderRow(
+                            label = "Couper le début (Trim)",
+                            valueText = "${"%.1f".format(Locale.US, mixConfig.trimStartSec)} s",
+                            value = mixConfig.trimStartSec,
+                            range = 0f..5.0f,
+                            onChange = { v -> onUpdateMixConfig { it.copy(trimStartSec = v) } }
+                        )
+                        MixSliderRow(
+                            label = "Couper la fin (Trim)",
+                            valueText = "${"%.1f".format(Locale.US, mixConfig.trimEndSec)} s",
+                            value = mixConfig.trimEndSec,
+                            range = 0f..5.0f,
+                            onChange = { v -> onUpdateMixConfig { it.copy(trimEndSec = v) } }
+                        )
+                        MixSliderRow(
+                            label = "Vitesse globale (sans rappel API)",
+                            valueText = "${"%.2f".format(Locale.US, mixConfig.playbackSpeed)}x",
+                            value = mixConfig.playbackSpeed,
+                            range = 0.85f..1.20f,
+                            onChange = { v -> onUpdateMixConfig { it.copy(playbackSpeed = v) } }
+                        )
+
+                        Text("Réverbération studio", style = MaterialTheme.typography.bodySmall)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            ReverbPreset.entries.forEach { preset ->
+                                FilterChip(
+                                    selected = mixConfig.reverbPreset == preset,
+                                    onClick = { onUpdateMixConfig { it.copy(reverbPreset = preset) } },
+                                    label = { Text(preset.labelFr) },
+                                    modifier = Modifier.testTag("reverb_chip_${preset.name.lowercase()}")
+                                )
+                            }
+                        }
+
+                        Text("Normalisation cible", style = MaterialTheme.typography.bodySmall)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            LoudnessTarget.entries.forEach { target ->
+                                val selected = abs(mixConfig.targetLufs - target.targetLufs) < 0.8f
+                                FilterChip(
+                                    selected = selected,
+                                    onClick = { onUpdateMixConfig { it.copy(targetLufs = target.targetLufs) } },
+                                    label = { Text(target.labelFr) },
+                                    modifier = Modifier.testTag("lufs_chip_${target.name.lowercase()}")
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -389,6 +460,22 @@ fun FinalPlayerCard(
                     Icon(Icons.Rounded.Share, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Partager", fontWeight = FontWeight.SemiBold)
+                }
+            }
+
+            if (onExportSrt != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onExportSrt,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("export_srt_button")
+                ) {
+                    Icon(Icons.Rounded.Subtitles, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Exporter les sous-titres (.srt)")
                 }
             }
         }

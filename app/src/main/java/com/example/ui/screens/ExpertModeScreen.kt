@@ -122,6 +122,7 @@ fun ExpertModeScreen(
     onToggleVoiceOnly: (Boolean) -> Unit,
     onUpdateMixConfig: ((MixConfig) -> MixConfig) -> Unit,
     onExport: (AudioExportFormat, Boolean) -> Unit,
+    onExportSrt: () -> Unit,
     onShare: (AudioExportFormat, Boolean) -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -505,7 +506,8 @@ fun ExpertModeScreen(
                 onToggleVoiceOnly = onToggleVoiceOnly,
                 onUpdateMixConfig = onUpdateMixConfig,
                 onExport = onExport,
-                onShare = onShare
+                onShare = onShare,
+                onExportSrt = onExportSrt
             )
         }
 

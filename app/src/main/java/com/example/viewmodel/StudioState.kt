@@ -4,6 +4,7 @@ import com.example.domain.model.AudioMetrics
 import com.example.domain.model.BriefPlan
 import com.example.domain.model.ContextualToneSuggestion
 import com.example.domain.model.CustomAmbience
+import com.example.domain.model.DialogueLine
 import com.example.domain.model.GenerationRecord
 import com.example.domain.model.LanguageOption
 import com.example.domain.model.MixConfig
@@ -13,11 +14,13 @@ import com.example.domain.model.PronunciationEntry
 import com.example.domain.model.ScriptVersion
 import com.example.domain.model.SegmentRuntimeState
 import com.example.domain.model.SessionUsage
+import com.example.domain.model.SpeechSpeed
 import com.example.domain.model.StudioMode
 import com.example.domain.model.StudioSettings
 import com.example.domain.model.TargetDurationOption
 import com.example.domain.model.VoiceGenderPreference
 import com.example.domain.script.LanguageDetectionResult
+import java.util.UUID
 
 enum class GenerationPhase(val labelFr: String) {
     IDLE("Prêt"),
@@ -43,6 +46,7 @@ data class UndoDeletedProject(
 
 data class ApiKeyTestState(
     val isTesting: Boolean = false,
+    val testingEntryId: String? = null,
     val isSuccess: Boolean? = null,
     val message: String? = null
 )
@@ -52,17 +56,26 @@ data class StudioUiState(
     val projectTitle: String = "",
     val mode: StudioMode = StudioMode.BRIEF,
 
-    // Mode Brief
+    // Mode Brief & Modèles
     val briefDescription: String = "",
     val briefRawText: String = "",
     val targetDuration: TargetDurationOption = TargetDurationOption.FREE,
     val selectedLanguage: LanguageOption = LanguageOption.AUTO,
     val genderPreference: VoiceGenderPreference = VoiceGenderPreference.AUTO,
+    val appliedPresetId: String? = null,
     val briefPlan: BriefPlan? = null,
     val isPlanningBrief: Boolean = false,
     val refinePrompt: String = "",
     val isRefining: Boolean = false,
     val lastRefinementNote: String? = null,
+
+    // Mode Dialogue multi-voix
+    val dialogueLines: List<DialogueLine> = listOf(
+        DialogueLine(id = "dlg_1", voiceName = "Kore", tone = "chaleureux", speed = SpeechSpeed.NORMAL, pauseBeforeSec = 0f, text = ""),
+        DialogueLine(id = "dlg_2", voiceName = "Puck", tone = "pub dynamique", speed = SpeechSpeed.NORMAL, pauseBeforeSec = 0.4f, text = "")
+    ),
+    val dialogueAmbienceName: String? = null,
+    val dialogueAmbienceVolumePercent: Int = 20,
 
     // Mode Expert
     val expertScript: String = "",
@@ -103,6 +116,7 @@ data class StudioUiState(
 
     // Ressources & Outils
     val generations: List<GenerationRecord> = emptyList(),
+    val allGenerations: List<GenerationRecord> = emptyList(),
     val activeGenerationId: String? = null,
     val projects: List<ProjectItem> = emptyList(),
     val scriptVersions: List<ScriptVersion> = emptyList(),
@@ -119,5 +133,6 @@ data class StudioUiState(
     val abTestPhrase: String = "",
     val abSlotA: AbTestSlot = AbTestSlot(voiceName = "Kore", tone = "chaleureux"),
     val abSlotB: AbTestSlot = AbTestSlot(voiceName = "Charon", tone = "sérieux"),
-    val apiKeyTestState: ApiKeyTestState = ApiKeyTestState()
+    val apiKeyTestState: ApiKeyTestState = ApiKeyTestState(),
+    val isExportingZip: Boolean = false
 )

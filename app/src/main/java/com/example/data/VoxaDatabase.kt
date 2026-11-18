@@ -30,6 +30,11 @@ data class ProjectEntity(
     val duckingAmountDb: Float,
     val fadeDurationSec: Float,
     val crossfadeMs: Int,
+    val trimStartSec: Float = 0f,
+    val trimEndSec: Float = 0f,
+    val targetLufs: Float = -16.0f,
+    val reverbPreset: String = "NONE",
+    val playbackSpeed: Float = 1.0f,
     val updatedAt: Long
 )
 
@@ -86,7 +91,9 @@ data class GenerationEntity(
     val waveformPeaksCsv: String,
     val ambiencesSummary: String,
     val segmentCount: Int,
-    val createdAt: Long
+    val createdAt: Long,
+    val isFavorite: Boolean = false,
+    val tagsCsv: String = ""
 )
 
 @Dao
@@ -145,11 +152,26 @@ interface VoxaDao {
     @Query("SELECT * FROM generations WHERE projectId = :projectId ORDER BY createdAt DESC LIMIT 30")
     fun observeGenerationsForProject(projectId: String): Flow<List<GenerationEntity>>
 
+    @Query("SELECT * FROM generations ORDER BY createdAt DESC LIMIT 150")
+    fun observeAllGenerations(): Flow<List<GenerationEntity>>
+
+    @Query("SELECT * FROM generations WHERE id = :id LIMIT 1")
+    suspend fun getGenerationById(id: String): GenerationEntity?
+
     @Query("SELECT * FROM generations WHERE projectId = :projectId")
     suspend fun getGenerationsForProjectOnce(projectId: String): List<GenerationEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertGeneration(generation: GenerationEntity)
+
+    @Query("UPDATE generations SET isFavorite = :isFavorite WHERE id = :id")
+    suspend fun updateGenerationFavorite(id: String, isFavorite: Boolean)
+
+    @Query("UPDATE generations SET title = :title WHERE id = :id")
+    suspend fun updateGenerationTitle(id: String, title: String)
+
+    @Query("UPDATE generations SET tagsCsv = :tagsCsv WHERE id = :id")
+    suspend fun updateGenerationTags(id: String, tagsCsv: String)
 
     @Query("DELETE FROM generations WHERE id = :id")
     suspend fun deleteGenerationById(id: String)
@@ -167,7 +189,7 @@ interface VoxaDao {
         CustomAmbienceEntity::class,
         GenerationEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class VoxaDatabase : RoomDatabase() {
@@ -177,7 +199,7 @@ abstract class VoxaDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: VoxaDatabase? = null
 
-        private val MIGRATION_1_2 = object : Migration(1, 2) {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
                     """
@@ -206,6 +228,18 @@ abstract class VoxaDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `generations` ADD COLUMN `isFavorite` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `generations` ADD COLUMN `tagsCsv` TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE `projects` ADD COLUMN `trimStartSec` REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE `projects` ADD COLUMN `trimEndSec` REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE `projects` ADD COLUMN `targetLufs` REAL NOT NULL DEFAULT -16.0")
+                db.execSQL("ALTER TABLE `projects` ADD COLUMN `reverbPreset` TEXT NOT NULL DEFAULT 'NONE'")
+                db.execSQL("ALTER TABLE `projects` ADD COLUMN `playbackSpeed` REAL NOT NULL DEFAULT 1.0")
+            }
+        }
+
         fun getInstance(context: Context): VoxaDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -213,7 +247,7 @@ abstract class VoxaDatabase : RoomDatabase() {
                     VoxaDatabase::class.java,
                     "voxa_studio.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     .also { INSTANCE = it }
             }

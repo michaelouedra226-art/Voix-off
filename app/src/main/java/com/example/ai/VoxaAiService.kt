@@ -7,6 +7,8 @@ import android.util.Log
 import com.example.audio.PcmUtils
 import com.example.domain.model.AmbienceCatalog
 import com.example.domain.model.AmbiencePlanItem
+import com.example.domain.model.ApiKeyEntry
+import com.example.domain.model.ApiPoolStrategy
 import com.example.domain.model.BriefPlan
 import com.example.domain.model.SpeechSpeed
 import com.example.domain.model.TargetDurationOption
@@ -26,6 +28,9 @@ import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -36,15 +41,16 @@ class BriefPlanningException(
 ) : Exception(message)
 
 /**
- * Service d'appels réels à Gemini via Firebase AI Logic :
- * - Planification et affinage de mise en scène audio via gemini-3.8-flash (JSON structuré)
- * - Synthèse vocale Gemini TTS avec direction d'acteur structurée et réessai progressif
+ * Service d'appels réels à Gemini via pool multi-clés REST direct ou Firebase AI Logic :
+ * - Planification et affinage de mise en scène audio (JSON structuré)
+ * - Synthèse vocale Gemini TTS avec rotation de clés, bascule sur quota et réessai progressif
  */
 class VoxaAiService(private val context: Context) {
 
     companion object {
         private const val TAG = "VoxaAiService"
         private const val DIRECTOR_MODEL = "gemini-3.8-flash"
+        private const val DIRECTOR_FALLBACK_MODEL = "gemini-2.5-flash"
     }
 
     private val briefSchema = Schema.obj(
@@ -170,6 +176,12 @@ class VoxaAiService(private val context: Context) {
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
+    private fun resolveEffectiveKeys(apiKey: String, apiKeys: List<String>): List<String> =
+        (apiKeys + listOf(apiKey))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
     suspend fun verifyPersonalApiKey(apiKey: String): Result<String> {
         val cleanKey = apiKey.trim()
         if (cleanKey.isEmpty()) {
@@ -183,14 +195,36 @@ class VoxaAiService(private val context: Context) {
                 GeminiDirectRestClient.verifyApiKey(cleanKey)
             }
             res.fold(
-                onSuccess = { Result.success(it) },
-                onFailure = { err -> Result.failure(IllegalStateException(translateAiError(err, usingPersonalKey = true), err)) }
+                onSuccess = {
+                    ApiPoolCoordinator.markSuccess(cleanKey)
+                    Result.success(it)
+                },
+                onFailure = { err ->
+                    Result.failure(IllegalStateException(translateAiError(err, usingPersonalKey = true), err))
+                }
             )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Result.failure(IllegalStateException(translateAiError(e, usingPersonalKey = true), e))
         }
+    }
+
+    suspend fun verifyApiKeyPool(entries: List<ApiKeyEntry>): List<ApiKeyEntry> = coroutineScope {
+        entries.map { entry ->
+            async {
+                val res = verifyPersonalApiKey(entry.apiKey)
+                res.fold(
+                    onSuccess = { msg -> entry.copy(lastStatusOk = true, lastStatusMessage = msg) },
+                    onFailure = { err ->
+                        entry.copy(
+                            lastStatusOk = false,
+                            lastStatusMessage = err.message ?: "Clé invalide"
+                        )
+                    }
+                )
+            }
+        }.awaitAll()
     }
 
     suspend fun generateBriefPlan(
@@ -200,14 +234,17 @@ class VoxaAiService(private val context: Context) {
         languageLabel: String,
         genderPreference: VoiceGenderPreference,
         preferredModelId: String,
-        apiKey: String = ""
+        apiKey: String = "",
+        apiKeys: List<String> = emptyList(),
+        poolStrategy: ApiPoolStrategy = ApiPoolStrategy.PARALLEL_BOOST,
+        allowModelFallback: Boolean = true
     ): BriefPlan {
-        val cleanKey = apiKey.trim()
-        val usePersonalKey = cleanKey.isNotEmpty()
+        val effectiveKeys = resolveEffectiveKeys(apiKey, apiKeys)
+        val usePersonalKey = effectiveKeys.isNotEmpty()
 
         if (!usePersonalKey && !ensureFirebaseAppInitialized(context)) {
             throw BriefPlanningException(
-                "Configuration Firebase absente dans cet APK. Ajoutez votre clé API Gemini personnelle dans Réglages ou vérifiez app/google-services.json.",
+                "Configuration Firebase absente dans cet APK. Ajoutez une ou plusieurs clés API Gemini dans Réglages ou vérifiez app/google-services.json.",
                 rawText.ifBlank { description }
             )
         }
@@ -239,20 +276,43 @@ class VoxaAiService(private val context: Context) {
             }
         }
 
+        val directorModels = if (usePersonalKey && allowModelFallback) {
+            listOf(DIRECTOR_MODEL, DIRECTOR_FALLBACK_MODEL)
+        } else {
+            listOf(DIRECTOR_MODEL)
+        }
+
         var lastError: Exception? = null
         // 1 tentative initiale + 1 réessai automatique si JSON invalide
         for (attempt in 0..1) {
             try {
                 val jsonText = withTimeout(60_000L) {
                     if (usePersonalKey) {
-                        GeminiDirectRestClient.generateStructuredJson(
-                            apiKey = cleanKey,
-                            modelId = DIRECTOR_MODEL,
-                            systemInstruction = directorSystemPromptText,
-                            prompt = prompt,
-                            responseSchemaJson = GeminiDirectRestClient.buildBriefResponseSchemaJson(),
-                            temperature = 0.5f
-                        )
+                        var modelError: Exception? = null
+                        var output: String? = null
+                        for ((mIdx, dirModel) in directorModels.withIndex()) {
+                            try {
+                                output = ApiPoolCoordinator.executeAcrossPool(effectiveKeys, poolStrategy) { selectedKey ->
+                                    GeminiDirectRestClient.generateStructuredJson(
+                                        apiKey = selectedKey,
+                                        modelId = dirModel,
+                                        systemInstruction = directorSystemPromptText,
+                                        prompt = prompt,
+                                        responseSchemaJson = GeminiDirectRestClient.buildBriefResponseSchemaJson(),
+                                        temperature = 0.5f
+                                    )
+                                }
+                                break
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                modelError = e
+                                if (mIdx == directorModels.lastIndex || !isQuotaOrModelUnavailable(e)) {
+                                    throw e
+                                }
+                            }
+                        }
+                        output ?: throw (modelError ?: IllegalStateException("Réponse vide du directeur artistique."))
                     } else {
                         val response = briefModel.generateContent(prompt)
                         response.text ?: throw IllegalStateException("Réponse vide du directeur artistique.")
@@ -282,13 +342,16 @@ class VoxaAiService(private val context: Context) {
         currentScript: String,
         instruction: String,
         customAmbienceNames: List<String>,
-        apiKey: String = ""
+        apiKey: String = "",
+        apiKeys: List<String> = emptyList(),
+        poolStrategy: ApiPoolStrategy = ApiPoolStrategy.PARALLEL_BOOST,
+        allowModelFallback: Boolean = true
     ): Pair<String, String> {
-        val cleanKey = apiKey.trim()
-        val usePersonalKey = cleanKey.isNotEmpty()
+        val effectiveKeys = resolveEffectiveKeys(apiKey, apiKeys)
+        val usePersonalKey = effectiveKeys.isNotEmpty()
 
         if (!usePersonalKey && !ensureFirebaseAppInitialized(context)) {
-            throw IllegalStateException("Configuration Firebase absente dans cet APK. Ajoutez votre clé API Gemini personnelle dans Réglages ou vérifiez app/google-services.json.")
+            throw IllegalStateException("Configuration Firebase absente dans cet APK. Ajoutez une clé API Gemini dans Réglages ou vérifiez app/google-services.json.")
         }
         if (!isNetworkAvailable()) {
             throw IllegalStateException("Vous êtes hors ligne. L'affinage par l'IA nécessite une connexion Internet.")
@@ -308,17 +371,40 @@ class VoxaAiService(private val context: Context) {
             Consigne importante : ne modifie QUE les balises ou passages concernés par la demande afin de conserver au maximum les autres segments identiques pour le cache audio. Ne modifie les mots parlés que si la demande le demande explicitement.
         """.trimIndent()
 
+        val directorModels = if (usePersonalKey && allowModelFallback) {
+            listOf(DIRECTOR_MODEL, DIRECTOR_FALLBACK_MODEL)
+        } else {
+            listOf(DIRECTOR_MODEL)
+        }
+
         try {
             val jsonText = withTimeout(60_000L) {
                 if (usePersonalKey) {
-                    GeminiDirectRestClient.generateStructuredJson(
-                        apiKey = cleanKey,
-                        modelId = DIRECTOR_MODEL,
-                        systemInstruction = directorSystemPromptText,
-                        prompt = prompt,
-                        responseSchemaJson = GeminiDirectRestClient.buildRefineResponseSchemaJson(),
-                        temperature = 0.3f
-                    )
+                    var modelError: Exception? = null
+                    var output: String? = null
+                    for ((mIdx, dirModel) in directorModels.withIndex()) {
+                        try {
+                            output = ApiPoolCoordinator.executeAcrossPool(effectiveKeys, poolStrategy) { selectedKey ->
+                                GeminiDirectRestClient.generateStructuredJson(
+                                    apiKey = selectedKey,
+                                    modelId = dirModel,
+                                    systemInstruction = directorSystemPromptText,
+                                    prompt = prompt,
+                                    responseSchemaJson = GeminiDirectRestClient.buildRefineResponseSchemaJson(),
+                                    temperature = 0.3f
+                                )
+                            }
+                            break
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            modelError = e
+                            if (mIdx == directorModels.lastIndex || !isQuotaOrModelUnavailable(e)) {
+                                throw e
+                            }
+                        }
+                    }
+                    output ?: throw (modelError ?: IllegalStateException("Réponse vide lors de l'affinage."))
                 } else {
                     val response = refineModel.generateContent(prompt)
                     response.text ?: throw IllegalStateException("Réponse vide lors de l'affinage.")
@@ -338,8 +424,8 @@ class VoxaAiService(private val context: Context) {
     }
 
     /**
-     * Appelle Gemini TTS (clé personnelle directe si fournie, sinon Firebase AI Logic)
-     * avec direction d'acteur structurée et réessai progressif sur erreurs 429 / 5xx / timeout.
+     * Appelle Gemini TTS via pool multi-clés (ou Firebase AI Logic si aucune clé personnelle),
+     * avec bascule immédiate entre clés, bascule optionnelle de modèle sur 429, et réessai progressif.
      */
     @OptIn(com.google.firebase.ai.type.PublicPreviewAPI::class)
     suspend fun synthesizeSegmentPcm(
@@ -350,13 +436,16 @@ class VoxaAiService(private val context: Context) {
         activeAmbience: String?,
         modelId: String,
         languageCode: String,
-        apiKey: String = ""
+        apiKey: String = "",
+        apiKeys: List<String> = emptyList(),
+        poolStrategy: ApiPoolStrategy = ApiPoolStrategy.PARALLEL_BOOST,
+        allowModelFallback: Boolean = true
     ): FloatArray {
-        val cleanKey = apiKey.trim()
-        val usePersonalKey = cleanKey.isNotEmpty()
+        val effectiveKeys = resolveEffectiveKeys(apiKey, apiKeys)
+        val usePersonalKey = effectiveKeys.isNotEmpty()
 
         if (!usePersonalKey && !ensureFirebaseAppInitialized(context)) {
-            throw IllegalStateException("Configuration Firebase absente dans cet APK. Ajoutez votre clé API Gemini personnelle dans Réglages ou vérifiez app/google-services.json.")
+            throw IllegalStateException("Configuration Firebase absente dans cet APK. Ajoutez une ou plusieurs clés API Gemini dans Réglages ou vérifiez app/google-services.json.")
         }
         if (!isNetworkAvailable()) {
             throw IllegalStateException("Hors ligne : impossible de contacter Gemini TTS.")
@@ -364,6 +453,11 @@ class VoxaAiService(private val context: Context) {
 
         val resolvedVoice = VoiceCatalog.findByName(voiceName)?.name ?: "Kore"
         val resolvedModel = TtsModelOption.fromId(modelId).modelId
+        val modelChain = if (usePersonalKey && allowModelFallback) {
+            (listOf(resolvedModel) + TtsModelOption.entries.map { it.modelId }).distinct()
+        } else {
+            listOf(resolvedModel)
+        }
 
         val ambienceHint = activeAmbience?.let {
             AmbienceCatalog.findByName(it)?.sceneHintFr ?: "avec en arrière-plan sonore : $it"
@@ -381,14 +475,31 @@ class VoxaAiService(private val context: Context) {
         for (attempt in 0..backoffDelaysMs.size) {
             try {
                 if (usePersonalKey) {
-                    return withTimeout(60_000L) {
-                        GeminiDirectRestClient.synthesizeTtsPcm(
-                            apiKey = cleanKey,
-                            modelId = resolvedModel,
-                            actorPrompt = actorPrompt,
-                            voiceName = resolvedVoice,
-                            languageCode = languageCode
-                        )
+                    return withTimeout(65_000L) {
+                        var modelErr: Exception? = null
+                        var pcmResult: FloatArray? = null
+                        for ((mIdx, candidateModel) in modelChain.withIndex()) {
+                            try {
+                                pcmResult = ApiPoolCoordinator.executeAcrossPool(effectiveKeys, poolStrategy) { selectedKey ->
+                                    GeminiDirectRestClient.synthesizeTtsPcm(
+                                        apiKey = selectedKey,
+                                        modelId = candidateModel,
+                                        actorPrompt = actorPrompt,
+                                        voiceName = resolvedVoice,
+                                        languageCode = languageCode
+                                    )
+                                }
+                                break
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                modelErr = e
+                                if (mIdx == modelChain.lastIndex || !isQuotaOrModelUnavailable(e)) {
+                                    throw e
+                                }
+                            }
+                        }
+                        pcmResult ?: throw (modelErr ?: IllegalStateException("Échec TTS sur le pool multi-clés."))
                     }
                 } else {
                     val speechCfg = if (languageCode != "auto" && languageCode.isNotBlank()) {
@@ -489,12 +600,30 @@ class VoxaAiService(private val context: Context) {
         )
     }
 
-    private fun isRetryableError(e: Exception): Boolean {
-        if (e is TimeoutCancellationException) return true
-        if (e is GeminiRestHttpException) {
-            return e.statusCode == 429 || e.statusCode in 500..599
+    private fun unwrapPoolError(e: Throwable): Throwable =
+        if (e is ApiPoolExhaustedException) e.lastError else e
+
+    private fun isQuotaOrModelUnavailable(e: Exception): Boolean {
+        val root = unwrapPoolError(e)
+        if (root is GeminiRestHttpException) {
+            return root.statusCode == 429 || root.statusCode == 404
         }
-        val msg = (e.message ?: "").lowercase()
+        val msg = (root.message ?: "").lowercase()
+        return msg.contains("429") ||
+            msg.contains("quota") ||
+            msg.contains("rate limit") ||
+            msg.contains("resource exhausted") ||
+            msg.contains("404") ||
+            msg.contains("not found")
+    }
+
+    private fun isRetryableError(e: Exception): Boolean {
+        val root = unwrapPoolError(e)
+        if (root is TimeoutCancellationException) return true
+        if (root is GeminiRestHttpException) {
+            return root.statusCode == 429 || root.statusCode in 500..599
+        }
+        val msg = (root.message ?: "").lowercase()
         return msg.contains("429") ||
             msg.contains("quota") ||
             msg.contains("rate limit") ||
@@ -508,35 +637,42 @@ class VoxaAiService(private val context: Context) {
     }
 
     fun translateAiError(e: Throwable, usingPersonalKey: Boolean = false): String {
-        if (e is GeminiRestHttpException) {
-            val lower = e.message.lowercase()
+        val poolCountSuffix = if (e is ApiPoolExhaustedException && e.attemptedKeysCount > 1) {
+            " (${e.attemptedKeysCount} clés du pool testées)"
+        } else {
+            ""
+        }
+        val root = unwrapPoolError(e)
+
+        if (root is GeminiRestHttpException) {
+            val lower = root.message.lowercase()
             return when {
-                e.statusCode == 400 && (e.apiStatus == "API_KEY_INVALID" || lower.contains("api key") || lower.contains("api_key_invalid")) ->
-                    "Clé API Gemini invalide. Vérifiez votre clé dans Réglages > Clé API Gemini personnelle."
-                e.statusCode == 401 || e.statusCode == 403 ->
-                    "Clé API Gemini refusée (${e.statusCode}). Vérifiez les restrictions ou la validité de votre clé dans Google AI Studio."
-                e.statusCode == 404 ->
-                    "Modèle introuvable pour votre clé API (404). Essayez un autre modèle TTS dans les Réglages."
-                e.statusCode == 429 ->
-                    "Quota de votre clé API Gemini dépassé (429). Patientez quelques instants avant de réessayer."
+                root.statusCode == 400 && (root.apiStatus == "API_KEY_INVALID" || lower.contains("api key") || lower.contains("api_key_invalid")) ->
+                    "Clé API Gemini invalide$poolCountSuffix. Vérifiez vos clés dans Réglages > Pool multi-API Gemini."
+                root.statusCode == 401 || root.statusCode == 403 ->
+                    "Clé API Gemini refusée (${root.statusCode})$poolCountSuffix. Vérifiez les restrictions ou la validité de vos clés dans Google AI Studio."
+                root.statusCode == 404 ->
+                    "Modèle introuvable pour votre clé API (404)$poolCountSuffix. Essayez un autre modèle TTS ou activez la bascule de modèle dans les Réglages."
+                root.statusCode == 429 ->
+                    "Quota atteint sur l'ensemble des clés$poolCountSuffix (429). Patientez quelques instants ou ajoutez une autre clé dans Réglages."
                 else ->
-                    "Erreur de l'API Gemini (${e.statusCode}) : ${e.message}"
+                    "Erreur de l'API Gemini (${root.statusCode})$poolCountSuffix : ${root.message}"
             }
         }
 
-        val raw = e.message.orEmpty()
+        val raw = root.message.orEmpty()
         val msg = raw.lowercase()
         return when {
             msg.contains("default firebaseapp is not initialized") || msg.contains("initializeapp(context)") ->
-                "Firebase n'est pas initialisé dans cet APK. Ajoutez votre clé API Gemini personnelle dans Réglages ou vérifiez app/google-services.json."
-            e is TimeoutCancellationException || msg.contains("timeout") ->
-                "Délai d'attente dépassé (60 s). Réessayez avec un segment plus court ou vérifiez votre connexion."
+                "Firebase n'est pas initialisé dans cet APK. Ajoutez une ou plusieurs clés API Gemini dans Réglages ou vérifiez app/google-services.json."
+            root is TimeoutCancellationException || msg.contains("timeout") ->
+                "Délai d'attente dépassé (60 s)$poolCountSuffix. Réessayez avec un segment plus court ou vérifiez votre connexion."
             !isNetworkAvailable() || msg.contains("unable to resolve host") || msg.contains("network") ->
                 "Hors ligne : aucune connexion Internet détectée. Vos projets et audios déjà générés restent accessibles localement."
             msg.contains("429") || msg.contains("quota") || msg.contains("resource_exhausted") ->
-                "Quota Gemini temporairement atteint (429). Patientez quelques instants avant de relancer la génération."
+                "Quota Gemini temporairement atteint$poolCountSuffix (429). Patientez quelques instants avant de relancer la génération."
             usingPersonalKey && (msg.contains("403") || msg.contains("401") || msg.contains("api key") || msg.contains("permission_denied")) ->
-                "Clé API Gemini refusée. Vérifiez votre clé dans Réglages > Clé API Gemini personnelle."
+                "Clé API Gemini refusée$poolCountSuffix. Vérifiez vos clés dans Réglages > Pool multi-API Gemini."
             msg.contains("403") || msg.contains("app check") || msg.contains("attestation") ->
                 if (com.example.BuildConfig.DEBUG) {
                     "Accès refusé par Firebase App Check (403) sur cet APK Debug hors d'AI Studio. Ajoutez votre clé API Gemini dans Réglages pour générer directement depuis ce téléphone."
@@ -544,13 +680,13 @@ class VoxaAiService(private val context: Context) {
                     "Accès refusé par Firebase App Check (403). Vérifiez la connexion réseau, l'heure de l'appareil ou ajoutez votre clé API Gemini dans Réglages."
                 }
             msg.contains("401") || msg.contains("unauthenticated") || msg.contains("api key") ->
-                "Authentification refusée par le service Gemini. Vérifiez votre clé API dans Réglages ou l'activation de Firebase AI Logic."
+                "Authentification refusée par le service Gemini$poolCountSuffix. Vérifiez vos clés API dans Réglages ou l'activation de Firebase AI Logic."
             msg.contains("404") || msg.contains("not found") ->
-                "Modèle sélectionné indisponible sur cette région. Essayez Gemini 3.1 Flash TTS ou Gemini 2.5 Flash TTS dans les Réglages."
+                "Modèle sélectionné indisponible sur cette région$poolCountSuffix. Essayez Gemini 3.1 Flash TTS ou Gemini 2.5 Flash TTS dans les Réglages."
             raw.isNotBlank() ->
-                "Erreur du service audio : $raw"
+                "Erreur du service audio$poolCountSuffix : $raw"
             else ->
-                "Une erreur inattendue est survenue lors de l'appel à Gemini."
+                "Une erreur inattendue est survenue lors de l'appel à Gemini$poolCountSuffix."
         }
     }
 }

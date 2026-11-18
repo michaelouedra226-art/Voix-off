@@ -63,20 +63,28 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
+import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.ai.ApiPoolCoordinator
 import com.example.ai.isFirebaseAppReady
 import com.example.audio.AudioPlayerEngine
 import com.example.audio.PlaybackState
 import com.example.domain.model.AmbienceCatalog
+import com.example.domain.model.ApiPoolStrategy
 import com.example.domain.model.CustomAmbience
 import com.example.domain.model.LanguageOption
 import com.example.domain.model.PresetTones
@@ -660,9 +668,18 @@ fun ProjectsScreen(
 fun SettingsAndDictionaryScreen(
     state: StudioUiState,
     onUpdateSettings: ((StudioSettings) -> StudioSettings) -> Unit,
-    onSavePersonalApiKey: (String) -> Unit,
     onTestPersonalApiKey: (String) -> Unit,
+    onAddPoolApiKey: (String, String) -> Unit,
+    onImportBatchApiKeys: (String) -> Unit,
+    onTogglePoolKeyEnabled: (String, Boolean) -> Unit,
+    onRemovePoolKey: (String) -> Unit,
+    onTestPoolKey: (String) -> Unit,
+    onTestAllPoolKeys: () -> Unit,
+    onSelectPoolStrategy: (ApiPoolStrategy) -> Unit,
+    onToggleModelFallbackOnQuota: (Boolean) -> Unit,
     onClearApiKeyTestState: () -> Unit,
+    onPickAutoExportFolder: (android.net.Uri, String) -> Unit,
+    onClearAutoExportFolder: () -> Unit,
     onAddDictionaryEntry: (String, String) -> Unit,
     onDeleteDictionaryEntry: (String) -> Unit,
     onClose: () -> Unit
@@ -672,10 +689,61 @@ fun SettingsAndDictionaryScreen(
     var phoneticInput by remember { mutableStateOf("") }
     var showVoiceMenu by remember { mutableStateOf(false) }
     var showLangMenu by remember { mutableStateOf(false) }
-    var apiKeyInput by remember(state.settings.personalGeminiApiKey) {
-        mutableStateOf(state.settings.personalGeminiApiKey)
-    }
+    var keyLabelInput by remember { mutableStateOf("") }
+    var apiKeyInput by remember { mutableStateOf("") }
     var showApiKey by remember { mutableStateOf(false) }
+    var showBatchImportDialog by remember { mutableStateOf(false) }
+    var batchKeysDraft by remember { mutableStateOf("") }
+
+    val poolStats by ApiPoolCoordinator.stats.collectAsStateWithLifecycle()
+    val activeKeys = remember(state.settings) { state.settings.activeApiKeys() }
+    val effectiveConcurrency = remember(state.settings) { state.settings.effectiveConcurrency() }
+
+    if (showBatchImportDialog) {
+        AlertDialog(
+            onDismissRequest = { showBatchImportDialog = false },
+            title = { Text("Importer plusieurs clés API") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Collez une clé par ligne (ou séparées par virgule / espace). Les doublons sont ignorés automatiquement.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = batchKeysDraft,
+                        onValueChange = { batchKeysDraft = it },
+                        label = { Text("Clés Gemini (AIza…)") },
+                        placeholder = { Text("AIzaSy...\nAIzaSy...\nAIzaSy...") },
+                        minLines = 4,
+                        maxLines = 8,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_batch_import_input")
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onImportBatchApiKeys(batchKeysDraft)
+                        batchKeysDraft = ""
+                        showBatchImportDialog = false
+                    },
+                    enabled = batchKeysDraft.isNotBlank(),
+                    modifier = Modifier.testTag("settings_batch_import_confirm")
+                ) {
+                    Text("Importer")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatchImportDialog = false }) {
+                    Text("Annuler")
+                }
+            }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -696,33 +764,37 @@ fun SettingsAndDictionaryScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Statut connexion Gemini (Clé personnelle directe ou Firebase AI Logic & App Check)
+            // Statut connexion Gemini (Pool multi-API ou Firebase AI Logic & App Check)
             item {
                 val context = LocalContext.current
                 val firebaseReady = remember(context) { isFirebaseAppReady(context) }
-                val hasPersonalKey = state.settings.personalGeminiApiKey.isNotBlank()
+                val hasActiveKeys = activeKeys.isNotEmpty()
                 val statusColor = when {
-                    hasPersonalKey -> StudioSuccess
+                    hasActiveKeys -> StudioSuccess
                     firebaseReady -> StudioSuccess
                     else -> StudioWarning
                 }
                 val statusIcon = when {
-                    hasPersonalKey -> Icons.Rounded.Key
+                    effectiveConcurrency >= 2 -> Icons.Rounded.Bolt
+                    hasActiveKeys -> Icons.Rounded.Key
                     firebaseReady -> Icons.Rounded.VerifiedUser
                     else -> Icons.Rounded.WarningAmber
                 }
                 val statusTitle = when {
-                    hasPersonalKey -> "Clé API Gemini personnelle active"
+                    activeKeys.size > 1 -> "Pool multi-API actif (${activeKeys.size} clés • ×$effectiveConcurrency)"
+                    hasActiveKeys -> "Clé API Gemini personnelle active"
                     firebaseReady -> "Connexion via Firebase AI Logic"
                     else -> "Configuration Firebase manquante"
                 }
                 val statusSubtitle = when {
-                    hasPersonalKey ->
-                        "Les requêtes passent directement par l'API Gemini avec votre clé (Firebase App Check contourné). Fonctionne sur tout APK Debug ou Release."
+                    activeKeys.size > 1 ->
+                        "Mode ${state.settings.apiPoolStrategy.labelFr} : vos clés cumulent leurs quotas RPM/TPM avec bascule instantanée sur 429."
+                    hasActiveKeys ->
+                        "Les requêtes passent directement par l'API Gemini avec votre clé (App Check contourné). Ajoutez d'autres clés pour multiplier votre quota et paralléliser."
                     firebaseReady ->
-                        "Authentification via App Check. Si vous rencontrez une erreur 403 sur un APK Debug installé hors d'AI Studio, renseignez votre clé Gemini ci-dessous."
+                        "Authentification via App Check. Si vous rencontrez une erreur 403 ou 429 sur APK Debug, ajoutez une ou plusieurs clés Gemini ci-dessous."
                     else ->
-                        "Ajoutez votre clé API Gemini personnelle ci-dessous pour utiliser l'application immédiatement, ou recompilez avec app/google-services.json."
+                        "Ajoutez au moins une clé API Gemini ci-dessous pour utiliser l'application immédiatement."
                 }
                 Surface(
                     shape = RoundedCornerShape(16.dp),
@@ -756,12 +828,11 @@ fun SettingsAndDictionaryScreen(
                 }
             }
 
-            // Clé API Gemini personnelle (optionnelle)
+            // Pool multi-API Gemini (Tokens & Puissance)
             item {
-                val savedKey = state.settings.personalGeminiApiKey
                 val trimmedDraft = apiKeyInput.trim()
-                val hasUnsavedChanges = trimmedDraft != savedKey
                 val testState = state.apiKeyTestState
+                val pool = state.settings.apiKeyPool
 
                 Surface(
                     shape = RoundedCornerShape(16.dp),
@@ -780,19 +851,24 @@ fun SettingsAndDictionaryScreen(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
-                                text = "Clé API Gemini personnelle (optionnelle)",
+                                text = "Pool multi-API Gemini",
                                 style = MaterialTheme.typography.titleMedium,
                                 modifier = Modifier.weight(1f)
                             )
-                            if (savedKey.isNotBlank()) {
+                            if (activeKeys.isNotEmpty()) {
                                 Surface(
                                     shape = RoundedCornerShape(8.dp),
                                     color = StudioSuccess.copy(alpha = 0.16f),
                                     contentColor = StudioSuccess
                                 ) {
                                     Text(
-                                        text = "Active",
+                                        text = if (effectiveConcurrency >= 2) {
+                                            "${activeKeys.size} clés • ×$effectiveConcurrency Turbo"
+                                        } else {
+                                            "${activeKeys.size} clé(s) active(s)"
+                                        },
                                         style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
                                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                                     )
                                 }
@@ -800,9 +876,21 @@ fun SettingsAndDictionaryScreen(
                         }
 
                         Text(
-                            text = "Utile si vous installez l'APK Debug sur téléphone (évite l'erreur App Check 403). Créez une clé gratuite sur Google AI Studio (aistudio.google.com). La clé reste enregistrée uniquement sur cet appareil.",
+                            text = "Ajoutez plusieurs clés Google AI Studio (comptes ou projets différents) pour cumuler vos tokens/minute, basculer automatiquement sur erreur 429 et accélérer les scripts multi-segments.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        OutlinedTextField(
+                            value = keyLabelInput,
+                            onValueChange = { keyLabelInput = it },
+                            label = { Text("Nom du compte / projet (optionnel)") },
+                            placeholder = { Text("Ex : Compte Perso, Projet Studio 2") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_pool_key_label_input")
                         )
 
                         OutlinedTextField(
@@ -812,7 +900,7 @@ fun SettingsAndDictionaryScreen(
                                 if (testState.message != null) onClearApiKeyTestState()
                             },
                             label = { Text("Clé API Gemini (AIza…)") },
-                            placeholder = { Text("Collez votre clé Google AI Studio") },
+                            placeholder = { Text("Collez une clé Google AI Studio") },
                             singleLine = true,
                             visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
                             keyboardOptions = KeyboardOptions(
@@ -866,44 +954,209 @@ fun SettingsAndDictionaryScreen(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Button(
-                                onClick = { onSavePersonalApiKey(trimmedDraft) },
-                                enabled = hasUnsavedChanges && !testState.isTesting,
+                                onClick = {
+                                    onAddPoolApiKey(keyLabelInput, trimmedDraft)
+                                    keyLabelInput = ""
+                                    apiKeyInput = ""
+                                },
+                                enabled = trimmedDraft.isNotEmpty() && !testState.isTesting,
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(48.dp)
-                                    .testTag("settings_save_api_key_button")
+                                    .testTag("settings_add_pool_key_button")
                             ) {
-                                Text("Enregistrer")
+                                Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Ajouter")
                             }
                             OutlinedButton(
-                                onClick = { onTestPersonalApiKey(trimmedDraft) },
+                                onClick = {
+                                    onTestPersonalApiKey(trimmedDraft)
+                                },
                                 enabled = trimmedDraft.isNotEmpty() && !testState.isTesting,
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier
                                     .height(48.dp)
                                     .testTag("settings_test_api_key_button")
                             ) {
-                                Text(if (testState.isTesting) "Test…" else "Tester")
+                                Text(if (testState.isTesting && testState.testingEntryId == null) "Test…" else "Tester")
                             }
-                            if (apiKeyInput.isNotEmpty() || savedKey.isNotEmpty()) {
-                                IconButton(
-                                    onClick = {
-                                        apiKeyInput = ""
-                                        onSavePersonalApiKey("")
-                                    },
+                            OutlinedButton(
+                                onClick = { showBatchImportDialog = true },
+                                enabled = !testState.isTesting,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .height(48.dp)
+                                    .testTag("settings_batch_import_keys_button")
+                            ) {
+                                Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, contentDescription = "Importer plusieurs clés en lot", modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Lot")
+                            }
+                        }
+
+                        if (pool.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                pool.forEach { entry ->
+                                    val isCooling = ApiPoolCoordinator.isInCooldown(entry.apiKey)
+                                    val isThisTesting = testState.isTesting && testState.testingEntryId == entry.id
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = MaterialTheme.colorScheme.background.copy(alpha = 0.45f),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (entry.enabled) MaterialTheme.colorScheme.outlineVariant
+                                            else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                        ),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                                ) {
+                                                    Text(
+                                                        text = entry.label,
+                                                        style = MaterialTheme.typography.titleSmall,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                    if (isCooling) {
+                                                        Surface(
+                                                            shape = RoundedCornerShape(6.dp),
+                                                            color = StudioWarning.copy(alpha = 0.18f),
+                                                            contentColor = StudioWarning
+                                                        ) {
+                                                            Text(
+                                                                text = "Pause 429",
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            )
+                                                        }
+                                                    } else if (entry.lastStatusOk != null) {
+                                                        val badgeColor = if (entry.lastStatusOk) StudioSuccess else StudioError
+                                                        Surface(
+                                                            shape = RoundedCornerShape(6.dp),
+                                                            color = badgeColor.copy(alpha = 0.16f),
+                                                            contentColor = badgeColor
+                                                        ) {
+                                                            Text(
+                                                                text = if (entry.lastStatusOk) "Valide" else "Erreur",
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                Text(
+                                                    text = entry.maskedPreview(),
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            IconButton(
+                                                onClick = { onTestPoolKey(entry.id) },
+                                                enabled = !testState.isTesting,
+                                                modifier = Modifier.size(48.dp)
+                                            ) {
+                                                if (isThisTesting) {
+                                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                                } else {
+                                                    Icon(
+                                                        Icons.Rounded.VerifiedUser,
+                                                        contentDescription = "Tester ${entry.label}",
+                                                        tint = MaterialTheme.colorScheme.primary
+                                                    )
+                                                }
+                                            }
+                                            Switch(
+                                                checked = entry.enabled,
+                                                onCheckedChange = { onTogglePoolKeyEnabled(entry.id, it) }
+                                            )
+                                            IconButton(
+                                                onClick = { onRemovePoolKey(entry.id) },
+                                                enabled = !testState.isTesting,
+                                                modifier = Modifier.size(48.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Rounded.DeleteOutline,
+                                                    contentDescription = "Retirer ${entry.label}",
+                                                    tint = StudioError
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (pool.size > 1) {
+                                OutlinedButton(
+                                    onClick = onTestAllPoolKeys,
                                     enabled = !testState.isTesting,
+                                    shape = RoundedCornerShape(12.dp),
                                     modifier = Modifier
-                                        .size(48.dp)
-                                        .testTag("settings_clear_api_key_button")
+                                        .fillMaxWidth()
+                                        .height(48.dp)
+                                        .testTag("settings_test_all_pool_keys_button")
                                 ) {
-                                    Icon(
-                                        Icons.Rounded.DeleteOutline,
-                                        contentDescription = "Effacer la clé API personnelle",
-                                        tint = StudioError
+                                    Text("Tester tout le pool (${pool.size} clés)")
+                                }
+                            }
+                        }
+
+                        // Stratégie d'utilisation du pool & bascule de modèle
+                        Text(
+                            text = "Stratégie multi-API",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        ApiPoolStrategy.entries.forEach { strategy ->
+                            val selected = state.settings.apiPoolStrategy == strategy
+                            Surface(
+                                onClick = { onSelectPoolStrategy(strategy) },
+                                shape = RoundedCornerShape(12.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                                else MaterialTheme.colorScheme.background.copy(alpha = 0.4f),
+                                contentColor = MaterialTheme.colorScheme.onSurface,
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+                                ),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Text(
+                                        text = strategy.labelFr,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = strategy.descriptionFr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
+                        }
+
+                        SettingSwitchRow(
+                            title = "Bascule auto de modèle sur quota (429)",
+                            subtitle = "Si toutes les clés atteignent le quota d'un modèle, tente automatiquement un autre modèle Gemini compatible.",
+                            checked = state.settings.modelFallbackOnQuota,
+                            onCheckedChange = onToggleModelFallbackOnQuota
+                        )
+
+                        if (poolStats.totalRequests > 0) {
+                            Text(
+                                text = "Télémétrie session : ${poolStats.totalRequests} appel(s) • ${poolStats.failoverSwitches} bascule(s) auto • ${poolStats.cooldownKeysCount} clé(s) en pause",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 }
@@ -1025,6 +1278,108 @@ fun SettingsAndDictionaryScreen(
                             checked = state.settings.completionSoundEnabled,
                             onCheckedChange = { v -> onUpdateSettings { it.copy(completionSoundEnabled = v) } }
                         )
+                    }
+                }
+            }
+
+            // Dossier d'export automatique
+            item {
+                val context = LocalContext.current
+                val folderPickerLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.OpenDocumentTree()
+                ) { treeUri ->
+                    if (treeUri != null) {
+                        val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        runCatching {
+                            context.contentResolver.takePersistableUriPermission(treeUri, flags)
+                        }
+                        val label = treeUri.lastPathSegment
+                            ?.substringAfter(':')
+                            ?.ifBlank { treeUri.lastPathSegment }
+                            ?: "Dossier choisi"
+                        onPickAutoExportFolder(treeUri, label)
+                    }
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text("Dossier d'export automatique", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            text = "Enregistre automatiquement chaque nouvelle génération audio dans le dossier de votre choix sur le téléphone.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        SettingSwitchRow(
+                            title = "Activer l'export automatique",
+                            subtitle = if (state.settings.autoExportTreeUri.isNotBlank()) {
+                                "Dossier : ${state.settings.autoExportFolderLabel}"
+                            } else {
+                                "Choisissez un dossier pour activer la sauvegarde directe."
+                            },
+                            checked = state.settings.autoExportEnabled && state.settings.autoExportTreeUri.isNotBlank(),
+                            onCheckedChange = { checked ->
+                                if (checked && state.settings.autoExportTreeUri.isBlank()) {
+                                    folderPickerLauncher.launch(null)
+                                } else {
+                                    onUpdateSettings { it.copy(autoExportEnabled = checked) }
+                                }
+                            }
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { folderPickerLauncher.launch(null) },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("settings_pick_auto_export_folder")
+                            ) {
+                                Text(
+                                    if (state.settings.autoExportTreeUri.isBlank()) "Choisir un dossier"
+                                    else "Changer de dossier"
+                                )
+                            }
+                            if (state.settings.autoExportTreeUri.isNotBlank()) {
+                                IconButton(
+                                    onClick = onClearAutoExportFolder,
+                                    modifier = Modifier.size(48.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.DeleteOutline,
+                                        contentDescription = "Retirer le dossier d'export",
+                                        tint = StudioError
+                                    )
+                                }
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilterChip(
+                                selected = state.settings.autoExportFormat == "M4A",
+                                onClick = { onUpdateSettings { it.copy(autoExportFormat = "M4A") } },
+                                label = { Text("Format M4A") }
+                            )
+                            FilterChip(
+                                selected = state.settings.autoExportFormat == "WAV",
+                                onClick = { onUpdateSettings { it.copy(autoExportFormat = "WAV") } },
+                                label = { Text("Format WAV") }
+                            )
+                            FilterChip(
+                                selected = state.settings.autoExportVoiceOnly,
+                                onClick = { onUpdateSettings { it.copy(autoExportVoiceOnly = !it.autoExportVoiceOnly) } },
+                                label = { Text("Voix seule") }
+                            )
+                        }
                     }
                 }
             }

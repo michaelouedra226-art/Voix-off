@@ -2,7 +2,10 @@ package com.example.data
 
 import android.content.Context
 import android.net.Uri
+import android.provider.DocumentsContract
 import com.example.audio.AmbienceSynthesizer
+import com.example.audio.AudioExportFormat
+import com.example.audio.AudioExporter
 import com.example.audio.PcmUtils
 import com.example.domain.model.AudioMetrics
 import com.example.domain.model.CustomAmbience
@@ -11,17 +14,23 @@ import com.example.domain.model.GenerationRecord
 import com.example.domain.model.MixConfig
 import com.example.domain.model.ProjectItem
 import com.example.domain.model.PronunciationEntry
+import com.example.domain.model.ReverbPreset
 import com.example.domain.model.ScriptVersion
 import com.example.domain.model.SegmentTake
 import com.example.domain.model.StudioMode
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
-import java.util.UUID
 
 /**
  * Référentiel principal gérant la persistance locale Room, le cache PCM sur disque
@@ -56,6 +65,21 @@ class VoxaRepository(
         dao.observeGenerationsForProject(projectId).map { list ->
             list.map { it.toDomain() }
         }
+
+    val allGenerationsFlow: Flow<List<GenerationRecord>> = dao.observeAllGenerations().map { list ->
+        list.map { it.toDomain() }
+    }
+
+    suspend fun readGenerationAudioBuffer(
+        record: GenerationRecord,
+        voiceOnly: Boolean
+    ): FloatArray = withContext(Dispatchers.IO) {
+        if (voiceOnly) {
+            val voiceSamples = PcmUtils.readFloatPcmFromFile(File(record.voiceOnlyPcmPath))
+            if (voiceSamples.isNotEmpty()) return@withContext voiceSamples
+        }
+        PcmUtils.readFloatPcmFromFile(File(record.mixedPcmPath))
+    }
 
     suspend fun saveGenerationRecord(
         projectId: String,
@@ -106,6 +130,127 @@ class VoxaRepository(
         File(record.mixedPcmPath).delete()
         File(record.voiceOnlyPcmPath).delete()
         dao.deleteGenerationById(record.id)
+    }
+
+    suspend fun setGenerationFavorite(id: String, isFavorite: Boolean) = withContext(Dispatchers.IO) {
+        dao.updateGenerationFavorite(id, isFavorite)
+    }
+
+    suspend fun renameGeneration(id: String, newTitle: String) = withContext(Dispatchers.IO) {
+        val cleaned = newTitle.trim().take(80)
+        if (cleaned.isNotEmpty()) {
+            dao.updateGenerationTitle(id, cleaned)
+        }
+    }
+
+    suspend fun updateGenerationTags(id: String, tags: List<String>) = withContext(Dispatchers.IO) {
+        val csv = tags
+            .map { it.trim().replace(",", " ") }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+            .take(8)
+            .joinToString(",")
+        dao.updateGenerationTags(id, csv)
+    }
+
+    suspend fun autoExportToFolderUri(
+        treeUriString: String,
+        record: GenerationRecord,
+        samples: FloatArray,
+        format: AudioExportFormat,
+        voiceOnly: Boolean
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val treeUri = Uri.parse(treeUriString)
+            val docId = DocumentsContract.getTreeDocumentId(treeUri)
+            val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+            val safeTitle = record.title
+                .replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                .trim('_')
+                .ifBlank { "voxa_studio" }
+                .take(36)
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(record.createdAt))
+            val suffix = if (voiceOnly) "_voix" else ""
+            val fileName = "${safeTitle}_${stamp}${suffix}.${format.extension}"
+
+            val createdUri = DocumentsContract.createDocument(
+                context.contentResolver,
+                parentDocUri,
+                format.mimeType,
+                fileName
+            ) ?: throw IllegalStateException("Dossier d'export inaccessible ou permission révoquée.")
+
+            AudioExporter.writeToSafUri(context, samples, format, createdUri)
+            fileName
+        }
+    }
+
+    suspend fun exportBatchZipToUri(
+        records: List<GenerationRecord>,
+        format: AudioExportFormat,
+        voiceOnly: Boolean,
+        destinationUri: Uri
+    ): Int = withContext(Dispatchers.IO) {
+        val out = context.contentResolver.openOutputStream(destinationUri)
+            ?: throw IllegalStateException("Impossible d'ouvrir l'archive ZIP de destination.")
+        var exportedAudioCount = 0
+        val usedNames = HashSet<String>()
+
+        out.use { rawStream ->
+            ZipOutputStream(rawStream).use { zos ->
+                for (record in records) {
+                    val base = record.title
+                        .replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                        .trim('_')
+                        .ifBlank { "voxa_${record.id.take(6)}" }
+                        .take(40)
+                    var candidate = base
+                    var suffixIdx = 2
+                    while (!usedNames.add("${candidate}.${format.extension}")) {
+                        candidate = "${base}_${suffixIdx++}"
+                    }
+
+                    val samples = readGenerationAudioBuffer(record, voiceOnly)
+                    if (samples.isNotEmpty()) {
+                        val entryName = "${candidate}.${format.extension}"
+                        zos.putNextEntry(ZipEntry(entryName))
+                        when (format) {
+                            AudioExportFormat.WAV -> {
+                                val baos = ByteArrayOutputStream()
+                                AudioExporter.writeWavToStream(samples, baos)
+                                zos.write(baos.toByteArray())
+                            }
+                            AudioExportFormat.M4A -> {
+                                val temp = File(context.cacheDir, "zip_m4a_${record.id.take(8)}.m4a")
+                                try {
+                                    AudioExporter.writeM4aToFile(samples, temp)
+                                    temp.inputStream().use { inp -> inp.copyTo(zos) }
+                                } finally {
+                                    temp.delete()
+                                }
+                            }
+                        }
+                        zos.closeEntry()
+                        exportedAudioCount++
+                    }
+
+                    if (record.annotatedScript.isNotBlank()) {
+                        zos.putNextEntry(ZipEntry("${candidate}_script.txt"))
+                        val header = buildString {
+                            appendLine("Titre : ${record.title}")
+                            appendLine("Voix : ${record.selectedVoice} | Modèle : ${record.modelId}")
+                            appendLine("Durée : ${"%.1f".format(Locale.US, record.durationSec)} s | ${"%.1f".format(Locale.US, record.integratedLufs)} LUFS")
+                            if (record.tags.isNotEmpty()) appendLine("Tags : ${record.tags.joinToString(", ")}")
+                            appendLine()
+                            append(record.annotatedScript)
+                        }
+                        zos.write(header.toByteArray(Charsets.UTF_8))
+                        zos.closeEntry()
+                    }
+                }
+            }
+        }
+        exportedAudioCount
     }
 
     suspend fun getProject(id: String): ProjectItem? =
@@ -267,6 +412,11 @@ class VoxaRepository(
                     put("duckingAmountDb", project.mixConfig.duckingAmountDb)
                     put("fadeDurationSec", project.mixConfig.fadeDurationSec)
                     put("crossfadeMs", project.mixConfig.crossfadeMs)
+                    put("trimStartSec", project.mixConfig.trimStartSec)
+                    put("trimEndSec", project.mixConfig.trimEndSec)
+                    put("targetLufs", project.mixConfig.targetLufs)
+                    put("reverbPreset", project.mixConfig.reverbPreset.name)
+                    put("playbackSpeed", project.mixConfig.playbackSpeed)
                 }
             )
         }.toString(2)
@@ -280,7 +430,12 @@ class VoxaRepository(
             ambienceVolume = mixObj?.optDouble("ambienceVolume", 1.0)?.toFloat() ?: 1.0f,
             duckingAmountDb = mixObj?.optDouble("duckingAmountDb", 10.0)?.toFloat() ?: 10.0f,
             fadeDurationSec = mixObj?.optDouble("fadeDurationSec", 1.5)?.toFloat() ?: 1.5f,
-            crossfadeMs = mixObj?.optInt("crossfadeMs", 80) ?: 80
+            crossfadeMs = mixObj?.optInt("crossfadeMs", 80) ?: 80,
+            trimStartSec = mixObj?.optDouble("trimStartSec", 0.0)?.toFloat() ?: 0f,
+            trimEndSec = mixObj?.optDouble("trimEndSec", 0.0)?.toFloat() ?: 0f,
+            targetLufs = mixObj?.optDouble("targetLufs", -16.0)?.toFloat() ?: -16.0f,
+            reverbPreset = ReverbPreset.fromName(mixObj?.optString("reverbPreset")),
+            playbackSpeed = mixObj?.optDouble("playbackSpeed", 1.0)?.toFloat() ?: 1.0f
         )
         val mode = runCatching { StudioMode.valueOf(obj.optString("mode", "EXPERT")) }
             .getOrDefault(StudioMode.EXPERT)
@@ -314,7 +469,12 @@ class VoxaRepository(
             ambienceVolume = ambienceVolume,
             duckingAmountDb = duckingAmountDb,
             fadeDurationSec = fadeDurationSec,
-            crossfadeMs = crossfadeMs
+            crossfadeMs = crossfadeMs,
+            trimStartSec = trimStartSec,
+            trimEndSec = trimEndSec,
+            targetLufs = targetLufs,
+            reverbPreset = ReverbPreset.fromName(reverbPreset),
+            playbackSpeed = playbackSpeed
         ),
         updatedAt = updatedAt
     )
@@ -334,6 +494,11 @@ class VoxaRepository(
         duckingAmountDb = mixConfig.duckingAmountDb,
         fadeDurationSec = mixConfig.fadeDurationSec,
         crossfadeMs = mixConfig.crossfadeMs,
+        trimStartSec = mixConfig.trimStartSec,
+        trimEndSec = mixConfig.trimEndSec,
+        targetLufs = mixConfig.targetLufs,
+        reverbPreset = mixConfig.reverbPreset.name,
+        playbackSpeed = mixConfig.playbackSpeed,
         updatedAt = updatedAt
     )
 
@@ -342,6 +507,11 @@ class VoxaRepository(
             emptyList()
         } else {
             waveformPeaksCsv.split(",").mapNotNull { it.toFloatOrNull() }
+        }
+        val parsedTags = if (tagsCsv.isBlank()) {
+            emptyList()
+        } else {
+            tagsCsv.split(",").map { it.trim() }.filter { it.isNotEmpty() }
         }
         return GenerationRecord(
             id = id,
@@ -360,7 +530,9 @@ class VoxaRepository(
             waveformPeaks = peaks,
             ambiencesSummary = ambiencesSummary,
             segmentCount = segmentCount,
-            createdAt = createdAt
+            createdAt = createdAt,
+            isFavorite = isFavorite,
+            tags = parsedTags
         )
     }
 }

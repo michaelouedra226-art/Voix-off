@@ -8,6 +8,8 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.domain.model.ApiKeyEntry
+import com.example.domain.model.ApiPoolStrategy
 import com.example.domain.model.LanguageOption
 import com.example.domain.model.SessionUsage
 import com.example.domain.model.StudioSettings
@@ -15,6 +17,8 @@ import com.example.domain.model.TtsModelOption
 import com.example.ui.theme.ThemeMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import org.json.JSONArray
+import org.json.JSONObject
 
 private val Context.voxaDataStore: DataStore<Preferences> by preferencesDataStore(name = "voxa_studio_prefs")
 
@@ -34,22 +38,18 @@ class SettingsDataStore(private val context: Context) {
         val TOTAL_API_CALLS = intPreferencesKey("total_api_calls")
         val TOTAL_CHARS = intPreferencesKey("total_chars_generated")
         val PERSONAL_GEMINI_API_KEY = stringPreferencesKey("personal_gemini_api_key")
+        val API_KEY_POOL_JSON = stringPreferencesKey("api_key_pool_json")
+        val API_POOL_STRATEGY = stringPreferencesKey("api_pool_strategy")
+        val MODEL_FALLBACK_ON_QUOTA = booleanPreferencesKey("model_fallback_on_quota")
+        val AUTO_EXPORT_ENABLED = booleanPreferencesKey("auto_export_enabled")
+        val AUTO_EXPORT_TREE_URI = stringPreferencesKey("auto_export_tree_uri")
+        val AUTO_EXPORT_FOLDER_LABEL = stringPreferencesKey("auto_export_folder_label")
+        val AUTO_EXPORT_FORMAT = stringPreferencesKey("auto_export_format")
+        val AUTO_EXPORT_VOICE_ONLY = booleanPreferencesKey("auto_export_voice_only")
     }
 
     val settingsFlow: Flow<StudioSettings> = context.voxaDataStore.data.map { prefs ->
-        StudioSettings(
-            defaultModelId = prefs[Keys.DEFAULT_MODEL] ?: TtsModelOption.GEMINI_3_1_FLASH_TTS.modelId,
-            defaultVoice = prefs[Keys.DEFAULT_VOICE] ?: "Kore",
-            defaultTone = prefs[Keys.DEFAULT_TONE] ?: "naturel",
-            defaultLanguageCode = prefs[Keys.DEFAULT_LANGUAGE] ?: LanguageOption.AUTO.code,
-            hapticsEnabled = prefs[Keys.HAPTICS_ENABLED] ?: true,
-            completionSoundEnabled = prefs[Keys.COMPLETION_SOUND] ?: true,
-            pronunciationNormalizationEnabled = prefs[Keys.PRONUNCIATION_NORM] ?: true,
-            themeMode = prefs[Keys.THEME_MODE]?.let {
-                runCatching { ThemeMode.valueOf(it) }.getOrNull()
-            } ?: ThemeMode.DARK,
-            personalGeminiApiKey = (prefs[Keys.PERSONAL_GEMINI_API_KEY] ?: "").trim()
-        )
+        readSettingsFromPreferences(prefs)
     }
 
     val activeProjectIdFlow: Flow<String?> = context.voxaDataStore.data.map { prefs ->
@@ -74,19 +74,7 @@ class SettingsDataStore(private val context: Context) {
 
     suspend fun updateSettings(transform: (StudioSettings) -> StudioSettings) {
         context.voxaDataStore.edit { prefs ->
-            val current = StudioSettings(
-                defaultModelId = prefs[Keys.DEFAULT_MODEL] ?: TtsModelOption.GEMINI_3_1_FLASH_TTS.modelId,
-                defaultVoice = prefs[Keys.DEFAULT_VOICE] ?: "Kore",
-                defaultTone = prefs[Keys.DEFAULT_TONE] ?: "naturel",
-                defaultLanguageCode = prefs[Keys.DEFAULT_LANGUAGE] ?: LanguageOption.AUTO.code,
-                hapticsEnabled = prefs[Keys.HAPTICS_ENABLED] ?: true,
-                completionSoundEnabled = prefs[Keys.COMPLETION_SOUND] ?: true,
-                pronunciationNormalizationEnabled = prefs[Keys.PRONUNCIATION_NORM] ?: true,
-                themeMode = prefs[Keys.THEME_MODE]?.let {
-                    runCatching { ThemeMode.valueOf(it) }.getOrNull()
-                } ?: ThemeMode.DARK,
-                personalGeminiApiKey = (prefs[Keys.PERSONAL_GEMINI_API_KEY] ?: "").trim()
-            )
+            val current = readSettingsFromPreferences(prefs)
             val updated = transform(current)
             prefs[Keys.DEFAULT_MODEL] = updated.defaultModelId
             prefs[Keys.DEFAULT_VOICE] = updated.defaultVoice
@@ -102,7 +90,107 @@ class SettingsDataStore(private val context: Context) {
             } else {
                 prefs[Keys.PERSONAL_GEMINI_API_KEY] = cleanedKey
             }
+            if (updated.apiKeyPool.isEmpty()) {
+                prefs.remove(Keys.API_KEY_POOL_JSON)
+            } else {
+                prefs[Keys.API_KEY_POOL_JSON] = encodeApiKeyPool(updated.apiKeyPool)
+            }
+            prefs[Keys.API_POOL_STRATEGY] = updated.apiPoolStrategy.name
+            prefs[Keys.MODEL_FALLBACK_ON_QUOTA] = updated.modelFallbackOnQuota
+            prefs[Keys.AUTO_EXPORT_ENABLED] = updated.autoExportEnabled
+            prefs[Keys.AUTO_EXPORT_TREE_URI] = updated.autoExportTreeUri
+            prefs[Keys.AUTO_EXPORT_FOLDER_LABEL] = updated.autoExportFolderLabel
+            prefs[Keys.AUTO_EXPORT_FORMAT] = updated.autoExportFormat
+            prefs[Keys.AUTO_EXPORT_VOICE_ONLY] = updated.autoExportVoiceOnly
         }
+    }
+
+    private fun readSettingsFromPreferences(prefs: Preferences): StudioSettings {
+        val personalKey = (prefs[Keys.PERSONAL_GEMINI_API_KEY] ?: "").trim()
+        val parsedPool = decodeApiKeyPool(prefs[Keys.API_KEY_POOL_JSON])
+        val normalizedPool = if (parsedPool.isEmpty() && personalKey.isNotEmpty()) {
+            listOf(
+                ApiKeyEntry(
+                    id = "primary_legacy",
+                    label = "Clé #1",
+                    apiKey = personalKey,
+                    enabled = true
+                )
+            )
+        } else {
+            parsedPool
+        }
+        return StudioSettings(
+            defaultModelId = prefs[Keys.DEFAULT_MODEL] ?: TtsModelOption.GEMINI_3_1_FLASH_TTS.modelId,
+            defaultVoice = prefs[Keys.DEFAULT_VOICE] ?: "Kore",
+            defaultTone = prefs[Keys.DEFAULT_TONE] ?: "naturel",
+            defaultLanguageCode = prefs[Keys.DEFAULT_LANGUAGE] ?: LanguageOption.AUTO.code,
+            hapticsEnabled = prefs[Keys.HAPTICS_ENABLED] ?: true,
+            completionSoundEnabled = prefs[Keys.COMPLETION_SOUND] ?: true,
+            pronunciationNormalizationEnabled = prefs[Keys.PRONUNCIATION_NORM] ?: true,
+            themeMode = prefs[Keys.THEME_MODE]?.let {
+                runCatching { ThemeMode.valueOf(it) }.getOrNull()
+            } ?: ThemeMode.DARK,
+            personalGeminiApiKey = personalKey,
+            apiKeyPool = normalizedPool,
+            apiPoolStrategy = ApiPoolStrategy.fromName(prefs[Keys.API_POOL_STRATEGY]),
+            modelFallbackOnQuota = prefs[Keys.MODEL_FALLBACK_ON_QUOTA] ?: true,
+            autoExportEnabled = prefs[Keys.AUTO_EXPORT_ENABLED] ?: false,
+            autoExportTreeUri = prefs[Keys.AUTO_EXPORT_TREE_URI] ?: "",
+            autoExportFolderLabel = prefs[Keys.AUTO_EXPORT_FOLDER_LABEL] ?: "",
+            autoExportFormat = prefs[Keys.AUTO_EXPORT_FORMAT] ?: "M4A",
+            autoExportVoiceOnly = prefs[Keys.AUTO_EXPORT_VOICE_ONLY] ?: false
+        )
+    }
+
+    private fun encodeApiKeyPool(pool: List<ApiKeyEntry>): String {
+        val arr = JSONArray()
+        for (entry in pool) {
+            val cleaned = entry.apiKey.trim()
+            if (cleaned.isEmpty()) continue
+            arr.put(
+                JSONObject().apply {
+                    put("id", entry.id)
+                    put("label", entry.label.trim())
+                    put("apiKey", cleaned)
+                    put("enabled", entry.enabled)
+                    if (entry.lastStatusOk != null) put("lastStatusOk", entry.lastStatusOk)
+                    if (!entry.lastStatusMessage.isNullOrBlank()) put("lastStatusMessage", entry.lastStatusMessage)
+                }
+            )
+        }
+        return arr.toString()
+    }
+
+    private fun decodeApiKeyPool(raw: String?): List<ApiKeyEntry> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val key = obj.optString("apiKey", "").trim()
+                    if (key.isEmpty()) continue
+                    val id = obj.optString("id", "key_$i").ifBlank { "key_$i" }
+                    val label = obj.optString("label", "Clé #${i + 1}").ifBlank { "Clé #${i + 1}" }
+                    val enabled = obj.optBoolean("enabled", true)
+                    val lastStatusOk = if (obj.has("lastStatusOk") && !obj.isNull("lastStatusOk")) {
+                        obj.optBoolean("lastStatusOk")
+                    } else null
+                    val lastStatusMessage = obj.optString("lastStatusMessage", "").takeIf { it.isNotBlank() }
+                    add(
+                        ApiKeyEntry(
+                            id = id,
+                            label = label,
+                            apiKey = key,
+                            enabled = enabled,
+                            lastStatusOk = lastStatusOk,
+                            lastStatusMessage = lastStatusMessage
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
     }
 
     suspend fun setActiveProjectId(projectId: String?) {

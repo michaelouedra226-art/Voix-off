@@ -4,6 +4,7 @@ import com.example.ui.theme.ThemeMode
 
 enum class StudioMode {
     BRIEF,
+    DIALOGUE,
     EXPERT
 }
 
@@ -271,14 +272,42 @@ data class SegmentRuntimeState(
         get() = takes.getOrNull(activeTakeIndex)
 }
 
-// --- Paramètres de mixage et métriques audio ---
+// --- Paramètres de mixage, post-traitement DSP et métriques audio ---
+
+enum class ReverbPreset(val labelFr: String, val wetMix: Float, val roomScale: Float) {
+    NONE("Aucune", 0f, 0f),
+    STUDIO("Studio", 0.14f, 0.45f),
+    HALL("Salle", 0.28f, 0.78f),
+    CINEMA("Cinéma", 0.38f, 1.0f);
+
+    companion object {
+        fun fromName(name: String?): ReverbPreset =
+            entries.firstOrNull { it.name.equals(name?.trim(), ignoreCase = true) } ?: NONE
+    }
+}
+
+enum class LoudnessTarget(val targetLufs: Float, val labelFr: String, val hintFr: String) {
+    LUFS_14(-14.0f, "-14 LUFS", "YouTube / Spotify / Reels"),
+    LUFS_16(-16.0f, "-16 LUFS", "Podcast / Radio (standard)"),
+    LUFS_19(-19.0f, "-19 LUFS", "Narration douce / Livre audio");
+
+    companion object {
+        fun closestTo(lufs: Float): LoudnessTarget =
+            entries.minByOrNull { kotlin.math.abs(it.targetLufs - lufs) } ?: LUFS_16
+    }
+}
 
 data class MixConfig(
     val voiceVolume: Float = 1.0f,        // 0.2 à 1.5
     val ambienceVolume: Float = 1.0f,     // 0.0 à 1.5 (multiplieur global)
     val duckingAmountDb: Float = 10.0f,   // 0 à 18 dB
     val fadeDurationSec: Float = 1.5f,    // 0.3 à 3.0 s
-    val crossfadeMs: Int = 80             // 60 à 100 ms
+    val crossfadeMs: Int = 80,            // 60 à 100 ms
+    val trimStartSec: Float = 0f,         // 0.0 à 5.0 s
+    val trimEndSec: Float = 0f,           // 0.0 à 5.0 s
+    val targetLufs: Float = -16.0f,       // -14, -16, -19 LUFS
+    val reverbPreset: ReverbPreset = ReverbPreset.NONE,
+    val playbackSpeed: Float = 1.0f       // 0.85x à 1.20x
 )
 
 data class AudioMetrics(
@@ -361,7 +390,9 @@ data class GenerationRecord(
     val waveformPeaks: List<Float>,
     val ambiencesSummary: String,
     val segmentCount: Int,
-    val createdAt: Long
+    val createdAt: Long,
+    val isFavorite: Boolean = false,
+    val tags: List<String> = emptyList()
 )
 
 data class PronunciationEntry(
@@ -378,6 +409,43 @@ data class CustomAmbience(
     val createdAt: Long
 )
 
+enum class ApiPoolStrategy(val labelFr: String, val descriptionFr: String) {
+    PARALLEL_BOOST(
+        "Turbo Parallèle",
+        "Synthétise plusieurs segments simultanément (1 par clé active) avec rotation et bascule automatique."
+    ),
+    ROUND_ROBIN(
+        "Rotation équilibrée",
+        "Répartit chaque appel tour à tour entre vos clés actives pour cumuler vos tokens."
+    ),
+    FAILOVER(
+        "Priorité + Secours",
+        "Utilise la première clé et bascule sur la suivante dès qu'un quota (429) est atteint."
+    );
+
+    companion object {
+        fun fromName(raw: String?): ApiPoolStrategy =
+            entries.firstOrNull { it.name.equals(raw?.trim(), ignoreCase = true) } ?: PARALLEL_BOOST
+    }
+}
+
+data class ApiKeyEntry(
+    val id: String,
+    val label: String,
+    val apiKey: String,
+    val enabled: Boolean = true,
+    val lastStatusOk: Boolean? = null,
+    val lastStatusMessage: String? = null
+) {
+    fun maskedPreview(): String {
+        val k = apiKey.trim()
+        return when {
+            k.length <= 8 -> "••••"
+            else -> "${k.take(6)}••••${k.takeLast(4)}"
+        }
+    }
+}
+
 data class StudioSettings(
     val defaultModelId: String = TtsModelOption.GEMINI_3_1_FLASH_TTS.modelId,
     val defaultVoice: String = "Kore",
@@ -387,8 +455,43 @@ data class StudioSettings(
     val completionSoundEnabled: Boolean = true,
     val pronunciationNormalizationEnabled: Boolean = true,
     val themeMode: ThemeMode = ThemeMode.DARK,
-    val personalGeminiApiKey: String = ""
-)
+    val personalGeminiApiKey: String = "",
+    val apiKeyPool: List<ApiKeyEntry> = emptyList(),
+    val apiPoolStrategy: ApiPoolStrategy = ApiPoolStrategy.PARALLEL_BOOST,
+    val modelFallbackOnQuota: Boolean = true,
+    val autoExportEnabled: Boolean = false,
+    val autoExportTreeUri: String = "",
+    val autoExportFolderLabel: String = "",
+    val autoExportFormat: String = "M4A",
+    val autoExportVoiceOnly: Boolean = false
+) {
+    fun activeApiKeys(): List<String> {
+        if (apiKeyPool.isNotEmpty()) {
+            val enabledKeys = apiKeyPool
+                .filter { it.enabled && it.apiKey.isNotBlank() }
+                .map { it.apiKey.trim() }
+                .distinct()
+            val primary = personalGeminiApiKey.trim()
+            val primaryInPool = apiKeyPool.any { it.apiKey.trim() == primary }
+            return if (primary.isNotEmpty() && !primaryInPool) {
+                (listOf(primary) + enabledKeys).distinct()
+            } else {
+                enabledKeys
+            }
+        }
+        val primary = personalGeminiApiKey.trim()
+        return if (primary.isNotEmpty()) listOf(primary) else emptyList()
+    }
+
+    fun effectiveConcurrency(): Int {
+        val activeCount = activeApiKeys().size
+        return when {
+            activeCount <= 1 -> 1
+            apiPoolStrategy == ApiPoolStrategy.PARALLEL_BOOST -> activeCount.coerceAtMost(4)
+            else -> 1
+        }
+    }
+}
 
 data class SessionUsage(
     val apiCallsCount: Int = 0,
@@ -417,3 +520,154 @@ data class AutocompleteSuggestion(
     val category: TagType,
     val subtitle: String? = null
 )
+
+// --- Mode Dialogue multi-voix assisté ---
+
+data class DialogueLine(
+    val id: String,
+    val voiceName: String = "Kore",
+    val tone: String = "naturel",
+    val speed: SpeechSpeed = SpeechSpeed.NORMAL,
+    val pauseBeforeSec: Float = 0.4f,
+    val text: String = ""
+)
+
+object DialogueCompiler {
+    fun compileScript(
+        lines: List<DialogueLine>,
+        ambienceName: String? = null,
+        ambienceVolumePercent: Int = 20
+    ): String {
+        val spokenLines = lines.filter { it.text.isNotBlank() }
+        if (spokenLines.isEmpty()) return ""
+
+        val sb = StringBuilder()
+        if (!ambienceName.isNullOrBlank()) {
+            val pct = ambienceVolumePercent.coerceIn(5, 80)
+            sb.append("[ambiance: ").append(ambienceName.trim()).append(", ").append(pct).append("%]\n")
+        }
+
+        spokenLines.forEachIndexed { index, line ->
+            if (index > 0 && line.pauseBeforeSec >= 0.2f) {
+                val pauseFormatted = "%.1f".format(java.util.Locale.US, line.pauseBeforeSec.coerceIn(0.2f, 5.0f))
+                sb.append("[pause: ").append(pauseFormatted).append("s]\n")
+            }
+            val safeVoice = VoiceCatalog.findByName(line.voiceName)?.name ?: "Kore"
+            val safeTone = line.tone.trim().ifBlank { "naturel" }
+            sb.append("[voix: ").append(safeVoice).append("] ")
+            sb.append("[ton: ").append(safeTone).append("] ")
+            sb.append("[vitesse: ").append(line.speed.labelFr).append("] ")
+            sb.append(line.text.trim())
+            if (index < spokenLines.lastIndex) {
+                sb.append('\n')
+            }
+        }
+        return sb.toString().trim()
+    }
+}
+
+// --- Modèles / Presets « Studio » prêts à l'emploi ---
+
+data class StudioPreset(
+    val id: String,
+    val titleFr: String,
+    val subtitleFr: String,
+    val briefDescription: String,
+    val sampleRawText: String,
+    val suggestedVoice: String,
+    val targetDuration: TargetDurationOption,
+    val genderPreference: VoiceGenderPreference,
+    val mixConfig: MixConfig
+)
+
+object StudioPresetCatalog {
+    val presets: List<StudioPreset> = listOf(
+        StudioPreset(
+            id = "pub_radio_30",
+            titleFr = "Pub radio 30s",
+            subtitleFr = "Énergique • -14 LUFS",
+            briefDescription = "Spot publicitaire radio de 30 secondes percutant, voix dynamique et chaleureuse, rythme rapide avec musique joyeuse légère en arrière-plan.",
+            sampleRawText = "",
+            suggestedVoice = "Puck",
+            targetDuration = TargetDurationOption.SEC_30,
+            genderPreference = VoiceGenderPreference.MASCULINE,
+            mixConfig = MixConfig(
+                voiceVolume = 1.08f,
+                ambienceVolume = 0.9f,
+                duckingAmountDb = 12f,
+                targetLufs = -14.0f,
+                reverbPreset = ReverbPreset.NONE
+            )
+        ),
+        StudioPreset(
+            id = "reel_tiktok",
+            titleFr = "Reel / TikTok",
+            subtitleFr = "Hook viral • 15s",
+            briefDescription = "Vidéo courte verticale 15 secondes très dynamique dès la première seconde, voix jeune et spontanée, débit vif avec micro-pauses d'accroche.",
+            sampleRawText = "",
+            suggestedVoice = "Leda",
+            targetDuration = TargetDurationOption.SEC_15,
+            genderPreference = VoiceGenderPreference.FEMININE,
+            mixConfig = MixConfig(
+                voiceVolume = 1.12f,
+                ambienceVolume = 0.85f,
+                duckingAmountDb = 11f,
+                targetLufs = -14.0f,
+                reverbPreset = ReverbPreset.STUDIO
+            )
+        ),
+        StudioPreset(
+            id = "podcast_intro",
+            titleFr = "Intro Podcast",
+            subtitleFr = "Chaleureux • -16 LUFS",
+            briefDescription = "Introduction de podcast accueillante et complice, voix posée proche du micro avec nappe douce en fondu d'entrée et de sortie.",
+            sampleRawText = "",
+            suggestedVoice = "Sulafat",
+            targetDuration = TargetDurationOption.SEC_60,
+            genderPreference = VoiceGenderPreference.FEMININE,
+            mixConfig = MixConfig(
+                voiceVolume = 1.0f,
+                ambienceVolume = 0.95f,
+                duckingAmountDb = 11f,
+                fadeDurationSec = 2.0f,
+                targetLufs = -16.0f,
+                reverbPreset = ReverbPreset.STUDIO
+            )
+        ),
+        StudioPreset(
+            id = "corporate_accueil",
+            titleFr = "Accueil pro",
+            subtitleFr = "Corporate • Net",
+            briefDescription = "Message d'accueil téléphonique ou présentation d'entreprise professionnelle, articulation claire, ton rassurant et crédible sans musique envahissante.",
+            sampleRawText = "",
+            suggestedVoice = "Gacrux",
+            targetDuration = TargetDurationOption.SEC_30,
+            genderPreference = VoiceGenderPreference.FEMININE,
+            mixConfig = MixConfig(
+                voiceVolume = 1.0f,
+                ambienceVolume = 0.65f,
+                duckingAmountDb = 12f,
+                targetLufs = -16.0f,
+                reverbPreset = ReverbPreset.NONE
+            )
+        ),
+        StudioPreset(
+            id = "narration_conte",
+            titleFr = "Conte / Récit",
+            subtitleFr = "Immersif • -19 LUFS",
+            briefDescription = "Narration calme et cinématographique, rythme posé avec respirations entre les phrases, pluie douce en fond et légère réverbération de salle.",
+            sampleRawText = "",
+            suggestedVoice = "Aoede",
+            targetDuration = TargetDurationOption.SEC_120,
+            genderPreference = VoiceGenderPreference.AUTO,
+            mixConfig = MixConfig(
+                voiceVolume = 1.0f,
+                ambienceVolume = 1.05f,
+                duckingAmountDb = 10f,
+                fadeDurationSec = 2.4f,
+                targetLufs = -19.0f,
+                reverbPreset = ReverbPreset.HALL
+            )
+        )
+    )
+}

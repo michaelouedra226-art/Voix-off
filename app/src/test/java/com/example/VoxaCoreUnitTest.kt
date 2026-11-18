@@ -1,17 +1,31 @@
 package com.example
 
+import com.example.ai.ApiPoolCoordinator
+import com.example.ai.ApiPoolExhaustedException
+import com.example.ai.GeminiRestHttpException
 import com.example.audio.AmbienceSynthesizer
+import com.example.audio.AudioExporter
 import com.example.audio.AudioMixerEngine
 import com.example.audio.PcmUtils
 import com.example.domain.model.AmbienceCatalog
+import com.example.domain.model.ApiKeyEntry
+import com.example.domain.model.ApiPoolStrategy
 import com.example.domain.model.DefectType
+import com.example.domain.model.DialogueCompiler
+import com.example.domain.model.DialogueLine
 import com.example.domain.model.MixConfig
 import com.example.domain.model.PronunciationEntry
+import com.example.domain.model.ReverbPreset
+import com.example.domain.model.SegmentTimingRange
 import com.example.domain.model.SpeechSpeed
+import com.example.domain.model.StudioPresetCatalog
+import com.example.domain.model.StudioSettings
 import com.example.domain.model.TimelineEvent
+import com.example.domain.model.VoiceCatalog
 import com.example.domain.script.BracketParser
 import com.example.domain.script.LanguageDetector
 import com.example.domain.script.PronunciationNormalizer
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -148,6 +162,112 @@ class VoxaCoreUnitTest {
     }
 
     @Test
+    fun `audio mixer post-processing applies trim, reverb, speed and target loudness cleanly`() {
+        val sr = PcmUtils.SAMPLE_RATE
+        val voiceSamples = FloatArray(sr * 2) { i ->
+            0.3f * sin(2.0 * Math.PI * 260.0 * i / sr).toFloat()
+        }
+        val tempFile = File.createTempFile("voxa_test_dsp", ".pcm")
+        try {
+            PcmUtils.writeFloatPcmToFile(tempFile, voiceSamples)
+            val parsed = BracketParser.parse("Premier segment de test complet.")
+            val pcmMap = parsed.segments.associate { it.id to tempFile.absolutePath }
+
+            val base = AudioMixerEngine.mixTimeline(
+                events = parsed.events,
+                segmentPcmPaths = pcmMap,
+                mixConfig = MixConfig(targetLufs = -16.0f),
+                customAmbiencePaths = emptyMap()
+            )
+            val processed = AudioMixerEngine.mixTimeline(
+                events = parsed.events,
+                segmentPcmPaths = pcmMap,
+                mixConfig = MixConfig(
+                    trimStartSec = 0.25f,
+                    trimEndSec = 0.25f,
+                    reverbPreset = ReverbPreset.STUDIO,
+                    playbackSpeed = 1.15f,
+                    targetLufs = -14.0f
+                ),
+                customAmbiencePaths = emptyMap()
+            )
+
+            assertTrue(processed.mixedPcm.isNotEmpty())
+            assertFalse(processed.mixedPcm.any { it.isNaN() || it.isInfinite() })
+            assertTrue(processed.metrics.durationSec < base.metrics.durationSec)
+            assertTrue(processed.metrics.peakDb <= -0.8f)
+            assertTrue(processed.metrics.segmentTimings.isNotEmpty())
+        } finally {
+            tempFile.delete()
+        }
+    }
+
+    @Test
+    fun `dialogue compiler round-trips cleanly through bracket parser`() {
+        val lines = listOf(
+            DialogueLine(
+                id = "l1",
+                voiceName = "Kore",
+                tone = "chaleureux",
+                speed = SpeechSpeed.NORMAL,
+                pauseBeforeSec = 0.0f,
+                text = "Bienvenue dans notre studio."
+            ),
+            DialogueLine(
+                id = "l2",
+                voiceName = "Charon",
+                tone = "posé",
+                speed = SpeechSpeed.LENT,
+                pauseBeforeSec = 0.8f,
+                text = "Merci pour cette invitation."
+            )
+        )
+        val compiled = DialogueCompiler.compileScript(
+            lines = lines,
+            ambienceName = "studio calme",
+            ambienceVolumePercent = 25
+        )
+        val parsed = BracketParser.parse(compiled)
+
+        assertTrue("Aucune erreur de syntaxe attendue", parsed.diagnostics.isEmpty())
+        assertEquals(2, parsed.segments.size)
+        assertEquals("Kore", parsed.segments[0].voice)
+        assertEquals("chaleureux", parsed.segments[0].tone)
+        assertEquals("studio calme", parsed.segments[0].activeAmbience)
+        assertEquals("Charon", parsed.segments[1].voice)
+        assertEquals("posé", parsed.segments[1].tone)
+        assertEquals(SpeechSpeed.LENT, parsed.segments[1].speed)
+        assertEquals(1, parsed.events.filterIsInstance<TimelineEvent.PauseEvent>().size)
+    }
+
+    @Test
+    fun `studio preset catalog provides valid presets with known voices`() {
+        val presets = StudioPresetCatalog.presets
+        assertTrue(presets.size >= 5)
+        assertEquals(presets.size, presets.map { it.id }.toSet().size)
+        for (preset in presets) {
+            assertTrue(preset.titleFr.isNotBlank())
+            assertTrue(preset.briefDescription.isNotBlank())
+            assertNotNull(VoiceCatalog.findByName(preset.suggestedVoice))
+        }
+    }
+
+    @Test
+    fun `audio exporter builds valid srt subtitle blocks`() {
+        val parsed = BracketParser.parse("Première réplique. [pause: 0.5s] Deuxième réplique.")
+        val timings = listOf(
+            SegmentTimingRange(parsed.segments[0].id, startSec = 0.0f, endSec = 1.45f),
+            SegmentTimingRange(parsed.segments[1].id, startSec = 1.95f, endSec = 3.5f)
+        )
+        val srt = AudioExporter.buildSrtContent(parsed.segments, timings, totalDurationSec = 3.5f)
+
+        assertTrue(srt.contains("1\n00:00:00,000 --> 00:00:01,450"))
+        assertTrue(srt.contains("Première réplique."))
+        assertTrue(srt.contains("2\n00:00:01,950 --> 00:00:03,500"))
+        assertTrue(srt.contains("Deuxième réplique."))
+    }
+
+    @Test
     fun `defect detector flags empty and short audio`() {
         val silent = FloatArray(PcmUtils.SAMPLE_RATE) { 0f }
         assertEquals(DefectType.EMPTY_AUDIO, PcmUtils.detectDefect(silent))
@@ -166,5 +286,80 @@ class VoxaCoreUnitTest {
         assertTrue(res.characterCount > 20_000)
         assertTrue(res.segments.isNotEmpty())
         assertTrue(res.segments.all { it.text.length <= BracketParser.MAX_SEGMENT_CHARS })
+    }
+
+    @Test
+    fun `studio settings multi-api pool resolves active keys and effective concurrency cleanly`() {
+        val legacyOnly = StudioSettings(personalGeminiApiKey = " AIzaLegacy ")
+        assertEquals(listOf("AIzaLegacy"), legacyOnly.activeApiKeys())
+        assertEquals(1, legacyOnly.effectiveConcurrency())
+
+        val poolSettings = StudioSettings(
+            personalGeminiApiKey = "AIzaKey1",
+            apiKeyPool = listOf(
+                ApiKeyEntry("1", "Compte 1", "AIzaKey1", enabled = false),
+                ApiKeyEntry("2", "Compte 2", "AIzaKey2", enabled = true),
+                ApiKeyEntry("3", "Compte 3", "AIzaKey3", enabled = true),
+                ApiKeyEntry("4", "Compte 4", "AIzaKey4", enabled = true),
+                ApiKeyEntry("5", "Compte 5", "AIzaKey5", enabled = true),
+                ApiKeyEntry("6", "Compte 6", "AIzaKey6", enabled = true)
+            ),
+            apiPoolStrategy = ApiPoolStrategy.PARALLEL_BOOST
+        )
+        // Clé #1 désactivée dans le pool ne doit pas être réactivée par personalGeminiApiKey
+        assertEquals(
+            listOf("AIzaKey2", "AIzaKey3", "AIzaKey4", "AIzaKey5", "AIzaKey6"),
+            poolSettings.activeApiKeys()
+        )
+        assertEquals(4, poolSettings.effectiveConcurrency())
+
+        val roundRobinSettings = poolSettings.copy(apiPoolStrategy = ApiPoolStrategy.ROUND_ROBIN)
+        assertEquals(1, roundRobinSettings.effectiveConcurrency())
+    }
+
+    @Test
+    fun `api pool coordinator rotates keys, cools down 429 keys and fails over automatically`() = runBlocking {
+        ApiPoolCoordinator.clearAll()
+        val keys = listOf("AIza_A", "AIza_B", "AIza_C")
+
+        val firstOrder = ApiPoolCoordinator.selectOrderedCandidates(keys, ApiPoolStrategy.ROUND_ROBIN, nowMs = 1_000L)
+        val secondOrder = ApiPoolCoordinator.selectOrderedCandidates(keys, ApiPoolStrategy.ROUND_ROBIN, nowMs = 1_000L)
+        assertEquals(listOf("AIza_A", "AIza_B", "AIza_C"), firstOrder)
+        assertEquals(listOf("AIza_B", "AIza_C", "AIza_A"), secondOrder)
+
+        ApiPoolCoordinator.markRateLimited("AIza_A", durationMs = 30_000L, nowMs = 1_000L)
+        assertTrue(ApiPoolCoordinator.isInCooldown("AIza_A", nowMs = 10_000L))
+        assertFalse(ApiPoolCoordinator.isInCooldown("AIza_A", nowMs = 35_000L))
+
+        val prioritizedOrder = ApiPoolCoordinator.selectOrderedCandidates(keys, ApiPoolStrategy.FAILOVER, nowMs = 10_000L)
+        assertEquals("AIza_B", prioritizedOrder.first())
+        assertEquals("AIza_A", prioritizedOrder.last())
+
+        // Execute across pool: AIza_B raises 429, AIza_C succeeds
+        ApiPoolCoordinator.clearAll()
+        val tried = mutableListOf<String>()
+        val result = ApiPoolCoordinator.executeAcrossPool(listOf("AIza_1", "AIza_2"), ApiPoolStrategy.FAILOVER) { key ->
+            tried.add(key)
+            if (key == "AIza_1") {
+                throw GeminiRestHttpException(429, "RESOURCE_EXHAUSTED", "Quota exceeded")
+            }
+            "OK:$key"
+        }
+        assertEquals("OK:AIza_2", result)
+        assertEquals(listOf("AIza_1", "AIza_2"), tried)
+        assertTrue(ApiPoolCoordinator.isInCooldown("AIza_1"))
+
+        // If every key fails, throws ApiPoolExhaustedException
+        ApiPoolCoordinator.clearAll()
+        var exhausted: ApiPoolExhaustedException? = null
+        try {
+            ApiPoolCoordinator.executeAcrossPool(listOf("AIza_X", "AIza_Y"), ApiPoolStrategy.ROUND_ROBIN) {
+                throw GeminiRestHttpException(429, "RESOURCE_EXHAUSTED", "All exhausted")
+            }
+        } catch (e: ApiPoolExhaustedException) {
+            exhausted = e
+        }
+        assertNotNull(exhausted)
+        assertEquals(2, exhausted?.attemptedKeysCount)
     }
 }

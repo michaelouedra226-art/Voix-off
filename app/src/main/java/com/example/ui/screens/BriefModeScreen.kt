@@ -81,6 +81,8 @@ import com.example.domain.model.LanguageOption
 import com.example.domain.model.MixConfig
 import com.example.domain.model.ScriptVersion
 import com.example.domain.model.SegmentStatus
+import com.example.domain.model.StudioPreset
+import com.example.domain.model.StudioPresetCatalog
 import com.example.domain.model.TargetDurationOption
 import com.example.domain.model.VoiceGenderPreference
 import com.example.ui.components.EmptyStudioBadge
@@ -113,6 +115,7 @@ fun BriefModeScreen(
     onSelectDuration: (TargetDurationOption) -> Unit,
     onSelectLanguage: (LanguageOption) -> Unit,
     onSelectGender: (VoiceGenderPreference) -> Unit,
+    onApplyPreset: (StudioPreset) -> Unit,
     onGenerateClick: () -> Unit,
     onPreviewPlanClick: () -> Unit,
     onCancelGeneration: () -> Unit,
@@ -128,6 +131,9 @@ fun BriefModeScreen(
     onSelectAndPlayGeneration: (GenerationRecord) -> Unit,
     onOpenGenerationInExpert: (GenerationRecord) -> Unit,
     onDeleteGeneration: (GenerationRecord) -> Unit,
+    onDownloadGeneration: (GenerationRecord, AudioExportFormat, Boolean) -> Unit,
+    onShareGeneration: (GenerationRecord, AudioExportFormat, Boolean) -> Unit,
+    onOpenGlobalHistory: () -> Unit,
     onClearError: () -> Unit,
     onTogglePlayFinal: () -> Unit,
     onSeekTo: (Float) -> Unit,
@@ -135,6 +141,7 @@ fun BriefModeScreen(
     onToggleVoiceOnly: (Boolean) -> Unit,
     onUpdateMixConfig: ((MixConfig) -> MixConfig) -> Unit,
     onExport: (AudioExportFormat, Boolean) -> Unit,
+    onExportSrt: () -> Unit,
     onShare: (AudioExportFormat, Boolean) -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -273,6 +280,55 @@ fun BriefModeScreen(
                         tint = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(18.dp)
                     )
+                }
+            }
+        }
+
+        // 0. Modèles / Presets « Studio » prêts à l'emploi
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("studio_presets_card")
+        ) {
+            Column(
+                modifier = Modifier.padding(vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Modèles Studio prêts à l'emploi",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 14.dp)
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 14.dp)
+                ) {
+                    StudioPresetCatalog.presets.forEach { preset ->
+                        val selected = state.appliedPresetId == preset.id
+                        FilterChip(
+                            selected = selected,
+                            onClick = { onApplyPreset(preset) },
+                            label = {
+                                Column(modifier = Modifier.padding(vertical = 2.dp)) {
+                                    Text(preset.titleFr, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        preset.subtitleFr,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            },
+                            modifier = Modifier.testTag("preset_chip_${preset.id}")
+                        )
+                    }
                 }
             }
         }
@@ -570,7 +626,8 @@ fun BriefModeScreen(
                     onToggleVoiceOnly = onToggleVoiceOnly,
                     onUpdateMixConfig = onUpdateMixConfig,
                     onExport = onExport,
-                    onShare = onShare
+                    onShare = onShare,
+                    onExportSrt = onExportSrt
                 )
 
                 // Affinage en langage naturel
@@ -719,11 +776,31 @@ fun BriefModeScreen(
 
             // Historique persistant des générations de ce projet
             if (state.generations.isNotEmpty()) {
-                Text(
-                    text = "Historique des prises générées",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Historique du projet",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                    if (state.allGenerations.isNotEmpty()) {
+                        TextButton(
+                            onClick = onOpenGlobalHistory,
+                            modifier = Modifier.testTag("brief_open_global_history")
+                        ) {
+                            Icon(
+                                Icons.Rounded.History,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text("Tout voir (${state.allGenerations.size})")
+                        }
+                    }
+                }
                 state.generations.forEachIndexed { index, record ->
                     GenerationHistoryCard(
                         record = record,
@@ -731,16 +808,36 @@ fun BriefModeScreen(
                         isActive = record.id == state.activeGenerationId && state.hasFinalAudio,
                         isPlaying = record.id == state.activeGenerationId && playback.activeTag == "final" && playback.isPlaying,
                         onPlayOrPause = { onSelectAndPlayGeneration(record) },
+                        onDownload = { fmt, voiceOnly -> onDownloadGeneration(record, fmt, voiceOnly) },
+                        onShare = { fmt, voiceOnly -> onShareGeneration(record, fmt, voiceOnly) },
                         onOpenInExpert = { onOpenGenerationInExpert(record) },
                         onDelete = { onDeleteGeneration(record) }
                     )
                 }
             } else if (!isGenerating && !state.isPlanningBrief && !state.hasFinalAudio && state.briefPlan == null && state.parseResult.segments.isEmpty()) {
                 EmptyStudioBadge(
-                    title = "Aucune génération pour l'instant",
-                    subtitle = "Saisissez votre demande ci-dessus puis touchez « Générer l'audio » pour voir vos générations, segments et exports ici.",
+                    title = "Aucune génération dans ce projet",
+                    subtitle = if (state.allGenerations.isNotEmpty()) {
+                        "Saisissez votre demande ci-dessus pour créer une nouvelle voix off, ou consultez vos ${state.allGenerations.size} création(s) dans l'Historique global."
+                    } else {
+                        "Saisissez votre demande ci-dessus puis touchez « Générer l'audio » pour voir vos générations, segments et exports ici."
+                    },
                     modifier = Modifier.testTag("brief_empty_generations")
                 )
+                if (state.allGenerations.isNotEmpty()) {
+                    OutlinedButton(
+                        onClick = onOpenGlobalHistory,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("brief_empty_open_global_history")
+                    ) {
+                        Icon(Icons.Rounded.History, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Ouvrir l'historique global (${state.allGenerations.size})")
+                    }
+                }
             }
         }
 
@@ -749,6 +846,7 @@ fun BriefModeScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GenerationHistoryCard(
     record: GenerationRecord,
@@ -756,6 +854,8 @@ private fun GenerationHistoryCard(
     isActive: Boolean,
     isPlaying: Boolean,
     onPlayOrPause: () -> Unit,
+    onDownload: (AudioExportFormat, Boolean) -> Unit,
+    onShare: (AudioExportFormat, Boolean) -> Unit,
     onOpenInExpert: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -812,7 +912,7 @@ private fun GenerationHistoryCard(
 
                 IconButton(
                     onClick = onDelete,
-                    modifier = Modifier.size(44.dp)
+                    modifier = Modifier.size(48.dp)
                 ) {
                     Icon(
                         Icons.Rounded.DeleteOutline,
@@ -854,14 +954,14 @@ private fun GenerationHistoryCard(
                 )
             }
 
-            Row(
+            FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
                     onClick = onPlayOrPause,
                     shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.height(44.dp)
+                    modifier = Modifier.height(48.dp)
                 ) {
                     Icon(
                         imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
@@ -872,10 +972,24 @@ private fun GenerationHistoryCard(
                     Text(if (isPlaying) "Pause" else if (isActive) "Écouter" else "Charger & écouter")
                 }
 
+                FilledDownloadMenuButton(
+                    label = "Télécharger",
+                    onDownload = onDownload,
+                    testTag = "brief_history_download_${record.id}"
+                )
+
+                OutlinedButton(
+                    onClick = { onShare(AudioExportFormat.M4A, false) },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text("Partager")
+                }
+
                 OutlinedButton(
                     onClick = onOpenInExpert,
                     shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.height(44.dp)
+                    modifier = Modifier.height(48.dp)
                 ) {
                     Icon(Icons.Rounded.EditNote, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(4.dp))
@@ -884,7 +998,7 @@ private fun GenerationHistoryCard(
 
                 TextButton(
                     onClick = { showScript = !showScript },
-                    modifier = Modifier.height(44.dp)
+                    modifier = Modifier.height(48.dp)
                 ) {
                     Text(if (showScript) "Masquer script" else "Script")
                 }

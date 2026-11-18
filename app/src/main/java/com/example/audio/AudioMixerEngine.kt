@@ -2,6 +2,7 @@ package com.example.audio
 
 import com.example.domain.model.AudioMetrics
 import com.example.domain.model.MixConfig
+import com.example.domain.model.ReverbPreset
 import com.example.domain.model.SegmentTimingRange
 import com.example.domain.model.TimelineEvent
 import java.io.File
@@ -13,6 +14,7 @@ import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tanh
@@ -196,31 +198,210 @@ object AudioMixerEngine {
             )
         }
 
-        // 5. Somme finale + Normalisation -16 LUFS + Limiteur à -1 dB
-        val mixed = FloatArray(totalSamples)
+        // 5. Somme finale + Post-traitement DSP (Vitesse, Réverb, Trim) + Normalisation cible
+        var mixed = FloatArray(totalSamples)
         for (i in 0 until totalSamples) {
             mixed[i] = voiceTrack[i] + ambienceTrack[i]
         }
+        var voiceOnlyProcessed = voiceTrack.copyOf()
+        var adjustedTimings: List<SegmentTimingRange> = segmentTimings
 
-        val voiceOnlyNormalized = voiceTrack.copyOf()
-        normalizeToTargetLufsWithPeakLimiter(voiceOnlyNormalized, targetLufs = -16.0f, peakLimitDb = -1.0f)
-        val (peakDb, lufs) = normalizeToTargetLufsWithPeakLimiter(mixed, targetLufs = -16.0f, peakLimitDb = -1.0f)
+        val speed = mixConfig.playbackSpeed.coerceIn(0.85f, 1.20f)
+        if (abs(speed - 1.0f) >= 0.01f) {
+            mixed = applyTimeStretch(mixed, speed)
+            voiceOnlyProcessed = applyTimeStretch(voiceOnlyProcessed, speed)
+            adjustedTimings = adjustedTimings.map {
+                it.copy(startSec = it.startSec / speed, endSec = it.endSec / speed)
+            }
+        }
 
+        if (mixConfig.reverbPreset != ReverbPreset.NONE) {
+            mixed = applyStudioReverb(mixed, mixConfig.reverbPreset)
+            voiceOnlyProcessed = applyStudioReverb(voiceOnlyProcessed, mixConfig.reverbPreset)
+        }
+
+        val trimStart = mixConfig.trimStartSec.coerceAtLeast(0f)
+        val trimEnd = mixConfig.trimEndSec.coerceAtLeast(0f)
+        if (trimStart > 0.01f || trimEnd > 0.01f) {
+            val trimResult = applyTrimWithFade(mixed, trimStart, trimEnd)
+            mixed = trimResult.first
+            val actualStartSec = trimResult.second
+            voiceOnlyProcessed = applyTrimWithFade(voiceOnlyProcessed, trimStart, trimEnd).first
+            val newDuration = mixed.size.toFloat() / SR
+            adjustedTimings = adjustedTimings.mapNotNull { range ->
+                val s = (range.startSec - actualStartSec).coerceIn(0f, newDuration)
+                val e = (range.endSec - actualStartSec).coerceIn(0f, newDuration)
+                if (e > s + 0.02f) range.copy(startSec = s, endSec = e) else null
+            }
+        }
+
+        val targetLufs = mixConfig.targetLufs.coerceIn(-24.0f, -11.0f)
+        normalizeToTargetLufsWithPeakLimiter(voiceOnlyProcessed, targetLufs = targetLufs, peakLimitDb = -1.0f)
+        val (peakDb, lufs) = normalizeToTargetLufsWithPeakLimiter(mixed, targetLufs = targetLufs, peakLimitDb = -1.0f)
+
+        val finalDurationSec = mixed.size.toFloat() / SR
         val metrics = AudioMetrics(
-            durationSec = totalSamples.toFloat() / SR,
+            durationSec = finalDurationSec,
             peakDb = peakDb,
             integratedLufs = lufs,
-            isClippingRisk = peakDb > -1.05f && PcmUtils.computePeakDb(voiceTrack) > -0.5f,
-            isTooQuiet = lufs < -28f && totalSamples > SR / 2,
+            isClippingRisk = peakDb > -1.05f && PcmUtils.computePeakDb(voiceOnlyProcessed) > -0.5f,
+            isTooQuiet = lufs < -28f && mixed.size > SR / 2,
             waveformPeaks = PcmUtils.computeWaveformPeaks(mixed),
-            segmentTimings = segmentTimings
+            segmentTimings = adjustedTimings
         )
 
         return MixResult(
             mixedPcm = mixed,
-            voiceOnlyPcm = voiceOnlyNormalized,
+            voiceOnlyPcm = voiceOnlyProcessed,
             metrics = metrics
         )
+    }
+
+    /**
+     * Coupe le début et/ou la fin avec micro-fondu anti-clic de 12 ms,
+     * en préservant au minimum 0,2 s d'audio pour éviter un tampon vide.
+     */
+    fun applyTrimWithFade(
+        samples: FloatArray,
+        trimStartSec: Float,
+        trimEndSec: Float
+    ): Pair<FloatArray, Float> {
+        if (samples.isEmpty()) return samples to 0f
+        val minKeep = min(samples.size, (SR * 0.2f).toInt().coerceAtLeast(1))
+        val requestedStart = (trimStartSec.coerceAtLeast(0f) * SR).roundToInt()
+        val requestedEnd = (trimEndSec.coerceAtLeast(0f) * SR).roundToInt()
+        val maxStart = (samples.size - minKeep).coerceAtLeast(0)
+        val startIdx = requestedStart.coerceIn(0, maxStart)
+        val minEnd = (startIdx + minKeep).coerceAtMost(samples.size)
+        val endIdx = (samples.size - requestedEnd).coerceIn(minEnd, samples.size)
+
+        val out = samples.copyOfRange(startIdx, endIdx)
+        val fadeSamples = min((SR * 0.012f).toInt(), out.size / 4)
+        for (i in 0 until fadeSamples) {
+            val gain = i.toFloat() / fadeSamples.coerceAtLeast(1)
+            out[i] *= gain
+            out[out.lastIndex - i] *= gain
+        }
+        return out to (startIdx.toFloat() / SR)
+    }
+
+    /**
+     * Réverbération studio de type Schroeder (4 filtres en peigne amortis + 2 passe-tout en série).
+     */
+    fun applyStudioReverb(samples: FloatArray, preset: ReverbPreset): FloatArray {
+        if (samples.isEmpty() || preset == ReverbPreset.NONE) return samples
+        val scale = preset.roomScale.coerceIn(0.2f, 1.2f)
+        val wet = preset.wetMix.coerceIn(0f, 0.55f)
+        val dry = 1f - wet * 0.45f
+
+        // Délais premiers adaptés à 24 kHz
+        val combDelays = intArrayOf(
+            (743 * scale).roundToInt().coerceAtLeast(64),
+            (887 * scale).roundToInt().coerceAtLeast(80),
+            (1021 * scale).roundToInt().coerceAtLeast(96),
+            (1153 * scale).roundToInt().coerceAtLeast(112)
+        )
+        val combFeedbacks = floatArrayOf(0.76f, 0.78f, 0.80f, 0.82f)
+        val combs = Array(combDelays.size) { FloatArray(combDelays[it]) }
+        val combIdx = IntArray(combDelays.size)
+        val combLp = FloatArray(combDelays.size)
+        val damp = 0.28f
+
+        val apDelays = intArrayOf(
+            (131 * scale).roundToInt().coerceAtLeast(24),
+            (47 * scale).roundToInt().coerceAtLeast(12)
+        )
+        val allpassBuf = Array(apDelays.size) { FloatArray(apDelays[it]) }
+        val allpassIdx = IntArray(apDelays.size)
+
+        val out = FloatArray(samples.size)
+        for (n in samples.indices) {
+            val inp = samples[n]
+            var combSum = 0f
+            for (c in combs.indices) {
+                val idx = combIdx[c]
+                val delayed = combs[c][idx]
+                combLp[c] = delayed * (1f - damp) + combLp[c] * damp
+                combs[c][idx] = inp + combLp[c] * combFeedbacks[c]
+                combIdx[c] = (idx + 1) % combDelays[c]
+                combSum += delayed
+            }
+            var wetSample = combSum * 0.25f
+
+            for (a in allpassBuf.indices) {
+                val idx = allpassIdx[a]
+                val bufOut = allpassBuf[a][idx]
+                val v = wetSample + bufOut * 0.5f
+                allpassBuf[a][idx] = v
+                allpassIdx[a] = (idx + 1) % apDelays[a]
+                wetSample = bufOut - wetSample * 0.5f
+            }
+
+            out[n] = inp * dry + wetSample * wet
+        }
+        return out
+    }
+
+    /**
+     * Changement de vitesse sans altérer la hauteur (SOLA / WSOLA simplifié à fenêtre de Hann).
+     */
+    fun applyTimeStretch(samples: FloatArray, speedFactor: Float): FloatArray {
+        val speed = speedFactor.coerceIn(0.85f, 1.20f)
+        if (samples.size < 2048 || abs(speed - 1.0f) < 0.01f) return samples
+
+        val frameSize = 1024
+        val synHop = 256
+        val anaHop = (synHop * speed).roundToInt().coerceAtLeast(64)
+        val outLen = ((samples.size - frameSize) / speed).roundToInt().coerceAtLeast(frameSize) + frameSize
+        val out = FloatArray(outLen)
+        val norm = FloatArray(outLen)
+
+        val window = FloatArray(frameSize) { i ->
+            (0.5 * (1.0 - cos(2.0 * PI * i / (frameSize - 1)))).toFloat()
+        }
+
+        var inPos = 0
+        var outPos = 0
+        val searchRadius = 48
+
+        while (inPos + frameSize < samples.size && outPos + frameSize < outLen) {
+            // Micro-alignement de phase par corrélation locale sur le chevauchement
+            var bestOffset = 0
+            if (outPos > 0) {
+                var bestCorr = Float.NEGATIVE_INFINITY
+                val minOff = max(-searchRadius, -inPos)
+                val maxOff = min(searchRadius, samples.size - frameSize - inPos - 1)
+                for (off in minOff..maxOff step 2) {
+                    var corr = 0f
+                    val candStart = inPos + off
+                    var k = 0
+                    while (k < synHop) {
+                        corr += samples[candStart + k] * out[outPos + k]
+                        k += 4
+                    }
+                    if (corr > bestCorr) {
+                        bestCorr = corr
+                        bestOffset = off
+                    }
+                }
+            }
+
+            val alignedIn = (inPos + bestOffset).coerceIn(0, samples.size - frameSize)
+            for (i in 0 until frameSize) {
+                val w = window[i]
+                out[outPos + i] += samples[alignedIn + i] * w
+                norm[outPos + i] += w
+            }
+            inPos += anaHop
+            outPos += synHop
+        }
+
+        val usedLen = min(outLen, outPos + frameSize)
+        val result = FloatArray(usedLen)
+        for (i in 0 until usedLen) {
+            result[i] = if (norm[i] > 1e-4f) out[i] / norm[i] else out[i]
+        }
+        return result
     }
 
     private fun applyCrossfadePlaceholder(samples: FloatArray, overlap: Int): FloatArray = samples

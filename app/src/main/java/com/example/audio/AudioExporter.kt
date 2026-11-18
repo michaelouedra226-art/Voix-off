@@ -8,11 +8,14 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import androidx.core.content.FileProvider
+import com.example.domain.model.SegmentTimingRange
+import com.example.domain.model.TimelineEvent
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 
 enum class AudioExportFormat(val extension: String, val mimeType: String, val labelFr: String) {
     WAV("wav", "audio/wav", "WAV Studio (sans perte)"),
@@ -198,5 +201,50 @@ object AudioExporter {
             put("data".toByteArray(Charsets.US_ASCII))
             putInt(pcmDataSize)
         }.array()
+    }
+
+    fun buildSrtContent(
+        segments: List<TimelineEvent.VoiceSegment>,
+        timings: List<SegmentTimingRange>,
+        totalDurationSec: Float
+    ): String {
+        if (segments.isEmpty()) return ""
+        val sb = StringBuilder()
+        val timingMap = timings.associateBy { it.segmentId }
+
+        var fallbackCursor = 0f
+        val estSum = segments.sumOf { it.estimatedDurationSec.toDouble() }.toFloat().coerceAtLeast(0.5f)
+        val scale = if (totalDurationSec > 0.2f) totalDurationSec / estSum else 1f
+
+        segments.forEachIndexed { idx, seg ->
+            val range = timingMap[seg.id]
+            val startSec = range?.startSec ?: fallbackCursor
+            val endSec = range?.endSec ?: (fallbackCursor + seg.estimatedDurationSec * scale)
+            fallbackCursor = endSec
+
+            sb.appendLine(idx + 1)
+            sb.append(formatSrtTimestamp(startSec))
+            sb.append(" --> ")
+            sb.appendLine(formatSrtTimestamp(maxOf(endSec, startSec + 0.1f)))
+            sb.appendLine(seg.text.trim())
+            if (idx < segments.lastIndex) sb.appendLine()
+        }
+        return sb.toString()
+    }
+
+    fun writeTextToSafUri(context: Context, text: String, destinationUri: Uri) {
+        context.contentResolver.openOutputStream(destinationUri)?.use { out ->
+            out.write(text.toByteArray(Charsets.UTF_8))
+            out.flush()
+        } ?: throw IllegalStateException("Impossible d'écrire le fichier de sous-titres.")
+    }
+
+    private fun formatSrtTimestamp(seconds: Float): String {
+        val totalMs = (seconds.coerceAtLeast(0f) * 1000f).toLong()
+        val hours = totalMs / 3_600_000L
+        val mins = (totalMs % 3_600_000L) / 60_000L
+        val secs = (totalMs % 60_000L) / 1000L
+        val ms = totalMs % 1000L
+        return "%02d:%02d:%02d,%03d".format(Locale.US, hours, mins, secs, ms)
     }
 }

@@ -29,14 +29,19 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            var pendingExport by remember { mutableStateOf<Pair<AudioExportFormat, Boolean>?>(null) }
+            var pendingExport by remember {
+                mutableStateOf<Triple<AudioExportFormat, Boolean, com.example.domain.model.GenerationRecord?>?>(null)
+            }
+            var pendingZipBatch by remember {
+                mutableStateOf<Triple<List<com.example.domain.model.GenerationRecord>, AudioExportFormat, Boolean>?>(null)
+            }
 
             val exportWavLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.CreateDocument("audio/wav")
             ) { uri ->
                 val spec = pendingExport
                 if (uri != null && spec != null) {
-                    viewModel.exportAudioToUri(uri, spec.first, spec.second)
+                    viewModel.exportAudioToUri(uri, spec.first, spec.second, spec.third)
                 }
                 pendingExport = null
             }
@@ -46,17 +51,36 @@ class MainActivity : ComponentActivity() {
             ) { uri ->
                 val spec = pendingExport
                 if (uri != null && spec != null) {
-                    viewModel.exportAudioToUri(uri, spec.first, spec.second)
+                    viewModel.exportAudioToUri(uri, spec.first, spec.second, spec.third)
                 }
                 pendingExport = null
             }
 
+            val exportSrtLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.CreateDocument("application/x-subrip")
+            ) { uri ->
+                if (uri != null) {
+                    viewModel.exportSrtToUri(uri)
+                }
+            }
+
+            val exportZipLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.CreateDocument("application/zip")
+            ) { uri ->
+                val batch = pendingZipBatch
+                if (uri != null && batch != null) {
+                    viewModel.exportBatchZipToUri(batch.first, batch.second, batch.third, uri)
+                }
+                pendingZipBatch = null
+            }
+
             VoxaStudioApp(
                 viewModel = viewModel,
-                onExportAudioRequest = { format, voiceOnly ->
-                    pendingExport = format to voiceOnly
+                onExportAudioRequest = { format, voiceOnly, record ->
+                    pendingExport = Triple(format, voiceOnly, record)
                     val suffix = if (voiceOnly) "_voix_seule" else ""
-                    val base = viewModel.uiState.value.projectTitle
+                    val rawTitle = record?.title?.ifBlank { null } ?: viewModel.uiState.value.projectTitle
+                    val base = rawTitle
                         .replace(Regex("[^a-zA-Z0-9_-]"), "_")
                         .ifBlank { "voxa_studio" }
                     val filename = "$base$suffix.${format.extension}"
@@ -65,6 +89,16 @@ class MainActivity : ComponentActivity() {
                     } else {
                         exportM4aLauncher.launch(filename)
                     }
+                },
+                onExportSrtRequest = {
+                    val base = viewModel.uiState.value.projectTitle
+                        .replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                        .ifBlank { "voxa_studio" }
+                    exportSrtLauncher.launch("$base.srt")
+                },
+                onBatchExportZipRequest = { records, format, voiceOnly ->
+                    pendingZipBatch = Triple(records, format, voiceOnly)
+                    exportZipLauncher.launch("voxa_studio_pack_${records.size}.zip")
                 }
             )
         }

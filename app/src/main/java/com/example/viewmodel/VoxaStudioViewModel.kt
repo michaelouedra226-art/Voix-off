@@ -5,6 +5,7 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -17,6 +18,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.R
+import com.example.ai.ApiPoolCoordinator
 import com.example.ai.BriefPlanningException
 import com.example.ai.VoxaAiService
 import com.example.audio.AmbienceSynthesizer
@@ -29,8 +31,12 @@ import com.example.audio.PlaybackState
 import com.example.data.SettingsDataStore
 import com.example.data.VoxaDatabase
 import com.example.data.VoxaRepository
+import com.example.domain.model.ApiKeyEntry
+import com.example.domain.model.ApiPoolStrategy
 import com.example.domain.model.AudioMetrics
 import com.example.domain.model.BriefPlan
+import com.example.domain.model.DialogueCompiler
+import com.example.domain.model.DialogueLine
 import com.example.domain.model.GenerationRecord
 import com.example.domain.model.LanguageOption
 import com.example.domain.model.MixConfig
@@ -38,7 +44,9 @@ import com.example.domain.model.ProjectItem
 import com.example.domain.model.ScriptVersion
 import com.example.domain.model.SegmentRuntimeState
 import com.example.domain.model.SegmentStatus
+import com.example.domain.model.SpeechSpeed
 import com.example.domain.model.StudioMode
+import com.example.domain.model.StudioPreset
 import com.example.domain.model.StudioSettings
 import com.example.domain.model.TargetDurationOption
 import com.example.domain.model.TimelineEvent
@@ -49,6 +57,9 @@ import com.example.domain.script.PronunciationNormalizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -59,9 +70,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 
 sealed interface StudioToastEvent {
     data class Info(val message: String) : StudioToastEvent
@@ -160,6 +176,11 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 }
             }
             launch {
+                repository.allGenerationsFlow.collect { allGens ->
+                    _uiState.update { it.copy(allGenerations = allGens) }
+                }
+            }
+            launch {
                 repository.dictionaryFlow.collect { dict ->
                     _uiState.update { it.copy(dictionary = dict) }
                 }
@@ -235,6 +256,131 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updateRefinePrompt(prompt: String) {
         _uiState.update { it.copy(refinePrompt = prompt) }
+    }
+
+    // --- Modèles Studio (Presets) ---
+
+    fun applyStudioPreset(preset: StudioPreset) {
+        _uiState.update {
+            it.copy(
+                appliedPresetId = preset.id,
+                projectTitle = it.projectTitle.ifBlank { preset.titleFr },
+                briefDescription = preset.briefDescription,
+                briefRawText = if (preset.sampleRawText.isNotBlank()) preset.sampleRawText else it.briefRawText,
+                targetDuration = preset.targetDuration,
+                genderPreference = preset.genderPreference,
+                selectedVoice = preset.suggestedVoice,
+                mixConfig = preset.mixConfig,
+                briefPlan = null,
+                errorMessage = null
+            )
+        }
+        scheduleAutoSave()
+        _toastEvents.tryEmit(StudioToastEvent.Info("Modèle « ${preset.titleFr} » appliqué."))
+    }
+
+    // --- Mode Dialogue multi-voix ---
+
+    fun addDialogueLine() {
+        _uiState.update { st ->
+            val lastVoice = st.dialogueLines.lastOrNull()?.voiceName ?: st.selectedVoice
+            val nextVoice = if (lastVoice.equals("Kore", ignoreCase = true)) "Puck" else "Kore"
+            val nextLine = DialogueLine(
+                id = UUID.randomUUID().toString(),
+                voiceName = nextVoice,
+                tone = st.settings.defaultTone,
+                speed = SpeechSpeed.NORMAL,
+                pauseBeforeSec = if (st.dialogueLines.isEmpty()) 0f else 0.4f,
+                text = ""
+            )
+            st.copy(dialogueLines = st.dialogueLines + nextLine)
+        }
+    }
+
+    fun updateDialogueLine(lineId: String, transform: (DialogueLine) -> DialogueLine) {
+        _uiState.update { st ->
+            st.copy(
+                dialogueLines = st.dialogueLines.map { line ->
+                    if (line.id == lineId) transform(line) else line
+                }
+            )
+        }
+    }
+
+    fun removeDialogueLine(lineId: String) {
+        _uiState.update { st ->
+            if (st.dialogueLines.size <= 1) {
+                st.copy(dialogueLines = st.dialogueLines.map { if (it.id == lineId) it.copy(text = "") else it })
+            } else {
+                st.copy(dialogueLines = st.dialogueLines.filterNot { it.id == lineId })
+            }
+        }
+    }
+
+    fun moveDialogueLine(index: Int, delta: Int) {
+        _uiState.update { st ->
+            val target = index + delta
+            if (index !in st.dialogueLines.indices || target !in st.dialogueLines.indices) return@update st
+            val mutable = st.dialogueLines.toMutableList()
+            val item = mutable.removeAt(index)
+            mutable.add(target, item)
+            st.copy(dialogueLines = mutable)
+        }
+    }
+
+    fun setDialogueAmbience(name: String?, volumePercent: Int? = null) {
+        _uiState.update { st ->
+            st.copy(
+                dialogueAmbienceName = name,
+                dialogueAmbienceVolumePercent = (volumePercent ?: st.dialogueAmbienceVolumePercent).coerceIn(5, 80)
+            )
+        }
+    }
+
+    fun openDialogueInExpert() {
+        val st = _uiState.value
+        val compiled = DialogueCompiler.compileScript(
+            lines = st.dialogueLines,
+            ambienceName = st.dialogueAmbienceName,
+            ambienceVolumePercent = st.dialogueAmbienceVolumePercent
+        )
+        if (compiled.isBlank()) {
+            _toastEvents.tryEmit(StudioToastEvent.Info("Écrivez au moins une réplique avant d'ouvrir dans l'éditeur Expert."))
+            return
+        }
+        val firstVoice = st.dialogueLines.firstOrNull { it.text.isNotBlank() }?.voiceName ?: st.selectedVoice
+        updateExpertScript(compiled, compiled.length)
+        _uiState.update { it.copy(mode = StudioMode.EXPERT, selectedVoice = firstVoice) }
+        saveNamedVersion("Dialogue multi-voix")
+    }
+
+    fun generateFromDialogue() {
+        val st = _uiState.value
+        val compiled = DialogueCompiler.compileScript(
+            lines = st.dialogueLines,
+            ambienceName = st.dialogueAmbienceName,
+            ambienceVolumePercent = st.dialogueAmbienceVolumePercent
+        )
+        if (compiled.isBlank()) {
+            triggerHaptic(isError = true)
+            _uiState.update { it.copy(errorMessage = "Ajoutez du texte à au moins une réplique pour générer le dialogue.") }
+            return
+        }
+        refreshNetworkStatus()
+        if (_uiState.value.isOffline) {
+            triggerHaptic(isError = true)
+            _uiState.update { it.copy(errorMessage = "Connexion Internet requise pour générer les voix du dialogue.") }
+            return
+        }
+        val firstVoice = st.dialogueLines.firstOrNull { it.text.isNotBlank() }?.voiceName ?: st.selectedVoice
+        updateExpertScript(compiled, compiled.length)
+        _uiState.update { it.copy(selectedVoice = firstVoice) }
+        saveNamedVersion("Dialogue (${st.dialogueLines.count { it.text.isNotBlank() }} répliques)")
+        generationJob?.cancel()
+        generationJob = viewModelScope.launch {
+            delay(60)
+            runSequentialGenerationPipeline(resumeOnly = false)
+        }
     }
 
     fun updateExpertScript(newScript: String, cursorPos: Int = newScript.length, pushUndo: Boolean = true) {
@@ -464,6 +610,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     "détectée automatiquement (français si la demande est en français)"
                 } else state.selectedLanguage.labelFr
 
+                val activeKeys = state.settings.activeApiKeys()
                 val plan = aiService.generateBriefPlan(
                     description = state.briefDescription,
                     rawText = state.briefRawText,
@@ -471,7 +618,9 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     languageLabel = langLabel,
                     genderPreference = state.genderPreference,
                     preferredModelId = state.selectedModelId,
-                    apiKey = state.settings.personalGeminiApiKey
+                    apiKeys = activeKeys,
+                    poolStrategy = state.settings.apiPoolStrategy,
+                    allowModelFallback = state.settings.modelFallbackOnQuota
                 )
 
                 _uiState.update {
@@ -513,7 +662,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         generationPhase = GenerationPhase.IDLE,
                         errorMessage = aiService.translateAiError(
                             e,
-                            usingPersonalKey = state.settings.personalGeminiApiKey.isNotBlank()
+                            usingPersonalKey = state.settings.activeApiKeys().isNotEmpty()
                         )
                     )
                 }
@@ -580,7 +729,9 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     currentScript = state.expertScript,
                     instruction = instruction,
                     customAmbienceNames = state.customAmbiences.map { it.name },
-                    apiKey = state.settings.personalGeminiApiKey
+                    apiKeys = state.settings.activeApiKeys(),
+                    poolStrategy = state.settings.apiPoolStrategy,
+                    allowModelFallback = state.settings.modelFallbackOnQuota
                 )
                 updateExpertScript(updatedScript, updatedScript.length)
                 saveNamedVersion("Affinage : ${instruction.take(28)}")
@@ -677,17 +828,18 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         val segmentPcmMap = HashMap<String, String>()
-        var anySegmentFailed = false
+        val pendingSegments = mutableListOf<Triple<Int, TimelineEvent.VoiceSegment, String>>()
+        val completedCount = AtomicInteger(0)
 
         for ((idx, seg) in segments.withIndex()) {
-            _uiState.update { it.copy(currentSegmentIndex = idx + 1) }
-
             val currentRuntime = _uiState.value.segmentStates[seg.id]
             val fp = computeSegmentFingerprint(seg)
 
             // Si reprise ou déjà prêt avec la bonne empreinte
             if (resumeOnly && currentRuntime?.status == SegmentStatus.READY && currentRuntime.fingerprint == fp && currentRuntime.activeTake != null) {
                 segmentPcmMap[seg.id] = currentRuntime.activeTake!!.pcmFilePath
+                val done = completedCount.incrementAndGet()
+                _uiState.update { it.copy(currentSegmentIndex = done) }
                 continue
             }
 
@@ -712,83 +864,118 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 val chosenPath = _uiState.value.segmentStates[seg.id]?.activeTake?.pcmFilePath ?: cached.pcmFilePath
                 segmentPcmMap[seg.id] = chosenPath
+                val done = completedCount.incrementAndGet()
+                _uiState.update { it.copy(currentSegmentIndex = done) }
                 continue
             }
 
-            // Appel Gemini TTS réel
-            _uiState.update { st ->
-                val map = st.segmentStates.toMutableMap()
-                map[seg.id] = (map[seg.id] ?: SegmentRuntimeState(seg.id, fp)).copy(
-                    status = SegmentStatus.GENERATING,
-                    errorMessage = null
-                )
-                st.copy(segmentStates = map)
-            }
-
-            try {
-                val effectiveLang = resolveEffectiveLanguageCode(seg.text)
-                val normalizedText = PronunciationNormalizer.applyAll(
-                    text = seg.text,
-                    languageCode = effectiveLang,
-                    normalizeStandardTokens = _uiState.value.settings.pronunciationNormalizationEnabled,
-                    customDictionary = _uiState.value.dictionary
-                )
-                val samples = aiService.synthesizeSegmentPcm(
-                    spokenText = normalizedText,
-                    voiceName = seg.voice,
-                    tone = seg.tone,
-                    speed = seg.speed,
-                    activeAmbience = seg.activeAmbience,
-                    modelId = _uiState.value.selectedModelId,
-                    languageCode = effectiveLang,
-                    apiKey = _uiState.value.settings.personalGeminiApiKey
-                )
-                val take = repository.saveSegmentTakeToDisk(fp, samples, saveAsPrimaryCache = true)
-                settingsStore.incrementUsage(normalizedText.length)
-
-                _uiState.update { st ->
-                    val map = st.segmentStates.toMutableMap()
-                    map[seg.id] = SegmentRuntimeState(
-                        segmentId = seg.id,
-                        fingerprint = fp,
-                        status = SegmentStatus.READY,
-                        fromCache = false,
-                        takes = listOf(take),
-                        activeTakeIndex = 0
-                    )
-                    st.copy(
-                        segmentStates = map,
-                        sessionUsage = st.sessionUsage.copy(
-                            apiCallsCount = st.sessionUsage.apiCallsCount + 1,
-                            generatedCharactersCount = st.sessionUsage.generatedCharactersCount + normalizedText.length
-                        )
-                    )
-                }
-                segmentPcmMap[seg.id] = take.pcmFilePath
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                anySegmentFailed = true
-                triggerHaptic(isError = true)
-                val msg = e.message ?: "Échec de génération du segment ${idx + 1}"
-                _uiState.update { st ->
-                    val map = st.segmentStates.toMutableMap()
-                    map[seg.id] = (map[seg.id] ?: SegmentRuntimeState(seg.id, fp)).copy(
-                        status = SegmentStatus.ERROR,
-                        errorMessage = msg
-                    )
-                    val cleanMsg = msg.trimEnd('.', ' ')
-                    st.copy(
-                        segmentStates = map,
-                        generationPhase = GenerationPhase.IDLE,
-                        errorMessage = "Segment ${idx + 1} sur ${segments.size} en erreur : $cleanMsg. Touchez « Reprendre » pour continuer sans perdre les segments déjà prêts."
-                    )
-                }
-                break
-            }
+            pendingSegments.add(Triple(idx, seg, fp))
         }
 
-        if (anySegmentFailed) return
+        if (pendingSegments.isNotEmpty()) {
+            val currentSettings = _uiState.value.settings
+            val activeKeys = currentSettings.activeApiKeys()
+            val poolStrategy = currentSettings.apiPoolStrategy
+            val allowModelFallback = currentSettings.modelFallbackOnQuota
+            val concurrency = currentSettings.effectiveConcurrency().coerceAtLeast(1)
+            val semaphore = Semaphore(concurrency)
+            val mapMutex = Mutex()
+            var firstFailure: Pair<Int, String>? = null
+
+            coroutineScope {
+                pendingSegments.map { (idx, seg, fp) ->
+                    async {
+                        semaphore.withPermit {
+                            _uiState.update { st ->
+                                val map = st.segmentStates.toMutableMap()
+                                map[seg.id] = (map[seg.id] ?: SegmentRuntimeState(seg.id, fp)).copy(
+                                    status = SegmentStatus.GENERATING,
+                                    errorMessage = null
+                                )
+                                st.copy(segmentStates = map)
+                            }
+
+                            try {
+                                val effectiveLang = resolveEffectiveLanguageCode(seg.text)
+                                val normalizedText = PronunciationNormalizer.applyAll(
+                                    text = seg.text,
+                                    languageCode = effectiveLang,
+                                    normalizeStandardTokens = currentSettings.pronunciationNormalizationEnabled,
+                                    customDictionary = _uiState.value.dictionary
+                                )
+                                val samples = aiService.synthesizeSegmentPcm(
+                                    spokenText = normalizedText,
+                                    voiceName = seg.voice,
+                                    tone = seg.tone,
+                                    speed = seg.speed,
+                                    activeAmbience = seg.activeAmbience,
+                                    modelId = _uiState.value.selectedModelId,
+                                    languageCode = effectiveLang,
+                                    apiKeys = activeKeys,
+                                    poolStrategy = poolStrategy,
+                                    allowModelFallback = allowModelFallback
+                                )
+                                val take = repository.saveSegmentTakeToDisk(fp, samples, saveAsPrimaryCache = true)
+                                settingsStore.incrementUsage(normalizedText.length)
+
+                                mapMutex.withLock {
+                                    segmentPcmMap[seg.id] = take.pcmFilePath
+                                }
+                                val done = completedCount.incrementAndGet()
+                                _uiState.update { st ->
+                                    val map = st.segmentStates.toMutableMap()
+                                    map[seg.id] = SegmentRuntimeState(
+                                        segmentId = seg.id,
+                                        fingerprint = fp,
+                                        status = SegmentStatus.READY,
+                                        fromCache = false,
+                                        takes = listOf(take),
+                                        activeTakeIndex = 0
+                                    )
+                                    st.copy(
+                                        currentSegmentIndex = done,
+                                        segmentStates = map,
+                                        sessionUsage = st.sessionUsage.copy(
+                                            apiCallsCount = st.sessionUsage.apiCallsCount + 1,
+                                            generatedCharactersCount = st.sessionUsage.generatedCharactersCount + normalizedText.length
+                                        )
+                                    )
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                val msg = e.message ?: "Échec de génération du segment ${idx + 1}"
+                                mapMutex.withLock {
+                                    if (firstFailure == null) {
+                                        firstFailure = idx to msg
+                                    }
+                                }
+                                _uiState.update { st ->
+                                    val map = st.segmentStates.toMutableMap()
+                                    map[seg.id] = (map[seg.id] ?: SegmentRuntimeState(seg.id, fp)).copy(
+                                        status = SegmentStatus.ERROR,
+                                        errorMessage = msg
+                                    )
+                                    st.copy(segmentStates = map)
+                                }
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            firstFailure?.let { (failedIdx, msg) ->
+                triggerHaptic(isError = true)
+                val cleanMsg = msg.trimEnd('.', ' ')
+                _uiState.update {
+                    it.copy(
+                        generationPhase = GenerationPhase.IDLE,
+                        errorMessage = "Segment ${failedIdx + 1} sur ${segments.size} en erreur : $cleanMsg. Touchez « Reprendre » pour continuer sans perdre les segments déjà prêts."
+                    )
+                }
+                return
+            }
+        }
 
         // Étape Mixage final
         mixCurrentSegments(parsed.events, segmentPcmMap, notifyOnFinish = true)
@@ -849,6 +1036,31 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 segmentCount = segCount
             )
             savedGenId = saved.id
+
+            // Export automatique vers le dossier choisi si activé
+            val cfg = currentState.settings
+            if (cfg.autoExportEnabled && cfg.autoExportTreeUri.isNotBlank()) {
+                val fmt = if (cfg.autoExportFormat.equals("WAV", ignoreCase = true)) {
+                    AudioExportFormat.WAV
+                } else {
+                    AudioExportFormat.M4A
+                }
+                val buf = if (cfg.autoExportVoiceOnly) mixResult.voiceOnlyPcm else mixResult.mixedPcm
+                val autoRes = repository.autoExportToFolderUri(
+                    treeUriString = cfg.autoExportTreeUri,
+                    record = saved,
+                    samples = buf,
+                    format = fmt,
+                    voiceOnly = cfg.autoExportVoiceOnly
+                )
+                autoRes.onSuccess { fileName ->
+                    _toastEvents.tryEmit(StudioToastEvent.Info("Export auto enregistré : $fileName"))
+                }.onFailure { err ->
+                    _toastEvents.tryEmit(
+                        StudioToastEvent.Info("Export auto ignoré : ${err.localizedMessage ?: "dossier inaccessible"}")
+                    )
+                }
+            }
         }
 
         _uiState.update {
@@ -932,6 +1144,25 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun openHistoryGenerationInStudio(record: GenerationRecord) {
+        viewModelScope.launch {
+            val parentProject = _uiState.value.projects.firstOrNull { it.id == record.projectId }
+            if (parentProject != null && parentProject.id != _uiState.value.activeProjectId) {
+                loadProjectIntoEditor(parentProject, _uiState.value.settings)
+                settingsStore.setActiveProjectId(parentProject.id)
+            }
+            updateExpertScript(record.annotatedScript, record.annotatedScript.length)
+            _uiState.update {
+                it.copy(
+                    mode = StudioMode.EXPERT,
+                    selectedVoice = record.selectedVoice,
+                    selectedModelId = record.modelId
+                )
+            }
+            loadGenerationIntoPlayer(record, autoPlay = false)
+        }
+    }
+
     fun deleteGeneration(record: GenerationRecord) {
         viewModelScope.launch {
             val wasActive = _uiState.value.activeGenerationId == record.id
@@ -949,6 +1180,26 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 }
             }
             _toastEvents.tryEmit(StudioToastEvent.Info("Génération supprimée."))
+        }
+    }
+
+    fun toggleGenerationFavorite(record: GenerationRecord) {
+        viewModelScope.launch {
+            repository.setGenerationFavorite(record.id, !record.isFavorite)
+        }
+    }
+
+    fun renameGeneration(record: GenerationRecord, newTitle: String) {
+        viewModelScope.launch {
+            repository.renameGeneration(record.id, newTitle)
+            _toastEvents.tryEmit(StudioToastEvent.Info("Génération renommée."))
+        }
+    }
+
+    fun updateGenerationTags(record: GenerationRecord, tags: List<String>) {
+        viewModelScope.launch {
+            repository.updateGenerationTags(record.id, tags)
+            _toastEvents.tryEmit(StudioToastEvent.Info("Tags mis à jour."))
         }
     }
 
@@ -979,6 +1230,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     normalizeStandardTokens = _uiState.value.settings.pronunciationNormalizationEnabled,
                     customDictionary = _uiState.value.dictionary
                 )
+                val cfg = _uiState.value.settings
                 val samples = aiService.synthesizeSegmentPcm(
                     spokenText = normalizedText,
                     voiceName = seg.voice,
@@ -987,7 +1239,9 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     activeAmbience = seg.activeAmbience,
                     modelId = _uiState.value.selectedModelId,
                     languageCode = effectiveLang,
-                    apiKey = _uiState.value.settings.personalGeminiApiKey
+                    apiKeys = cfg.activeApiKeys(),
+                    poolStrategy = cfg.apiPoolStrategy,
+                    allowModelFallback = cfg.modelFallbackOnQuota
                 )
                 val newTake = repository.saveSegmentTakeToDisk(
                     fingerprint = fp,
@@ -1073,7 +1327,9 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     activeAmbience = null,
                     modelId = st.selectedModelId,
                     languageCode = resolveEffectiveLanguageCode(cleaned),
-                    apiKey = st.settings.personalGeminiApiKey
+                    apiKeys = st.settings.activeApiKeys(),
+                    poolStrategy = st.settings.apiPoolStrategy,
+                    allowModelFallback = st.settings.modelFallbackOnQuota
                 )
                 playerEngine.playSamplesOnce("passage", samples)
             } catch (e: Exception) {
@@ -1081,7 +1337,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     it.copy(
                         errorMessage = aiService.translateAiError(
                             e,
-                            usingPersonalKey = _uiState.value.settings.personalGeminiApiKey.isNotBlank()
+                            usingPersonalKey = _uiState.value.settings.activeApiKeys().isNotEmpty()
                         )
                     )
                 }
@@ -1158,6 +1414,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 val samples = if (cached != null) {
                     PcmUtils.readFloatPcmFromFile(File(cached.pcmFilePath))
                 } else {
+                    val cfg = _uiState.value.settings
                     val generated = aiService.synthesizeSegmentPcm(
                         spokenText = sampleLine,
                         voiceName = voiceName,
@@ -1166,7 +1423,9 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         activeAmbience = null,
                         modelId = _uiState.value.selectedModelId,
                         languageCode = if (lang == LanguageOption.AUTO) "fr-FR" else lang.code,
-                        apiKey = _uiState.value.settings.personalGeminiApiKey
+                        apiKeys = cfg.activeApiKeys(),
+                        poolStrategy = cfg.apiPoolStrategy,
+                        allowModelFallback = cfg.modelFallbackOnQuota
                     )
                     repository.saveSegmentTakeToDisk(fp, generated, saveAsPrimaryCache = true)
                     settingsStore.incrementUsage(sampleLine.length)
@@ -1178,7 +1437,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                     it.copy(
                         voicePreviewError = aiService.translateAiError(
                             e,
-                            usingPersonalKey = _uiState.value.settings.personalGeminiApiKey.isNotBlank()
+                            usingPersonalKey = _uiState.value.settings.activeApiKeys().isNotEmpty()
                         )
                     )
                 }
@@ -1217,6 +1476,8 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
             }
             val lang = resolveEffectiveLanguageCode(phrase)
             val modelId = _uiState.value.selectedModelId
+            val cfg = _uiState.value.settings
+            val activeKeys = cfg.activeApiKeys()
 
             suspend fun synthSlot(slot: AbTestSlot): AbTestSlot {
                 return try {
@@ -1228,7 +1489,9 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         activeAmbience = null,
                         modelId = modelId,
                         languageCode = lang,
-                        apiKey = _uiState.value.settings.personalGeminiApiKey
+                        apiKeys = activeKeys,
+                        poolStrategy = cfg.apiPoolStrategy,
+                        allowModelFallback = cfg.modelFallbackOnQuota
                     )
                     settingsStore.incrementUsage(phrase.length)
                     slot.copy(
@@ -1241,16 +1504,31 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                         isLoading = false,
                         error = aiService.translateAiError(
                             e,
-                            usingPersonalKey = _uiState.value.settings.personalGeminiApiKey.isNotBlank()
+                            usingPersonalKey = activeKeys.isNotEmpty()
                         )
                     )
                 }
             }
 
-            val resA = synthSlot(_uiState.value.abSlotA)
-            _uiState.update { it.copy(abSlotA = resA) }
-            val resB = synthSlot(_uiState.value.abSlotB)
-            _uiState.update { it.copy(abSlotB = resB) }
+            if (cfg.effectiveConcurrency() >= 2) {
+                coroutineScope {
+                    val defA = async {
+                        val r = synthSlot(_uiState.value.abSlotA)
+                        _uiState.update { it.copy(abSlotA = r) }
+                    }
+                    val defB = async {
+                        val r = synthSlot(_uiState.value.abSlotB)
+                        _uiState.update { it.copy(abSlotB = r) }
+                    }
+                    defA.await()
+                    defB.await()
+                }
+            } else {
+                val resA = synthSlot(_uiState.value.abSlotA)
+                _uiState.update { it.copy(abSlotA = resA) }
+                val resB = synthSlot(_uiState.value.abSlotB)
+                _uiState.update { it.copy(abSlotB = resB) }
+            }
         }
     }
 
@@ -1266,18 +1544,129 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
         return if (voiceOnly) voiceOnlyFinalPcm else mixedFinalPcm
     }
 
-    fun exportAudioToUri(uri: Uri, format: AudioExportFormat, voiceOnly: Boolean) {
-        val samples = getExportBuffer(voiceOnly)
-        if (samples.isEmpty()) {
-            _toastEvents.tryEmit(StudioToastEvent.Info("Aucun audio généré à exporter."))
-            return
-        }
+    fun exportAudioToUri(
+        uri: Uri,
+        format: AudioExportFormat,
+        voiceOnly: Boolean,
+        record: GenerationRecord? = null
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val samples = if (record != null) {
+                    repository.readGenerationAudioBuffer(record, voiceOnly)
+                } else {
+                    getExportBuffer(voiceOnly)
+                }
+                if (samples.isEmpty()) {
+                    _toastEvents.tryEmit(StudioToastEvent.Info("Aucun audio disponible pour cette génération."))
+                    return@launch
+                }
                 AudioExporter.writeToSafUri(appContext, samples, format, uri)
                 _toastEvents.tryEmit(StudioToastEvent.Info("Fichier ${format.extension.uppercase()} enregistré avec succès."))
             } catch (e: Exception) {
                 _uiState.update { it.copy(errorMessage = "Échec de l'export : ${e.localizedMessage}") }
+            }
+        }
+    }
+
+    fun exportSrtToUri(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val st = _uiState.value
+                val segments = st.parseResult.segments
+                val timings = st.audioMetrics?.segmentTimings.orEmpty()
+                val totalSec = st.audioMetrics?.durationSec ?: st.parseResult.estimatedTotalDurationSec
+                val srt = AudioExporter.buildSrtContent(segments, timings, totalSec)
+                if (srt.isBlank()) {
+                    _toastEvents.tryEmit(StudioToastEvent.Info("Aucun segment disponible pour générer les sous-titres .srt."))
+                    return@launch
+                }
+                AudioExporter.writeTextToSafUri(appContext, srt, uri)
+                _toastEvents.tryEmit(StudioToastEvent.Info("Sous-titres .srt enregistrés."))
+            } catch (e: Exception) {
+                _uiState.update { it.copy(errorMessage = "Échec de l'export .srt : ${e.localizedMessage}") }
+            }
+        }
+    }
+
+    fun exportBatchZipToUri(
+        records: List<GenerationRecord>,
+        format: AudioExportFormat,
+        voiceOnly: Boolean,
+        destinationUri: Uri
+    ) {
+        if (records.isEmpty()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isExportingZip = true) }
+            try {
+                val count = repository.exportBatchZipToUri(records, format, voiceOnly, destinationUri)
+                _toastEvents.tryEmit(
+                    StudioToastEvent.Info("Archive ZIP créée ($count audio(s) + scripts).")
+                )
+            } catch (e: Exception) {
+                _uiState.update { it.copy(errorMessage = "Échec de l'export ZIP : ${e.localizedMessage}") }
+            } finally {
+                _uiState.update { it.copy(isExportingZip = false) }
+            }
+        }
+    }
+
+    fun setAutoExportFolder(treeUri: Uri, label: String) {
+        viewModelScope.launch {
+            settingsStore.updateSettings {
+                it.copy(
+                    autoExportEnabled = true,
+                    autoExportTreeUri = treeUri.toString(),
+                    autoExportFolderLabel = label.ifBlank { "Dossier sélectionné" }
+                )
+            }
+            _toastEvents.tryEmit(StudioToastEvent.Info("Dossier d'export automatique configuré."))
+        }
+    }
+
+    fun clearAutoExportFolder() {
+        viewModelScope.launch {
+            settingsStore.updateSettings {
+                it.copy(
+                    autoExportEnabled = false,
+                    autoExportTreeUri = "",
+                    autoExportFolderLabel = ""
+                )
+            }
+        }
+    }
+
+    fun shareAudio(
+        format: AudioExportFormat,
+        voiceOnly: Boolean,
+        record: GenerationRecord? = null,
+        onIntentReady: (Intent) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val intent = withContext(Dispatchers.IO) {
+                    val samples = if (record != null) {
+                        repository.readGenerationAudioBuffer(record, voiceOnly)
+                    } else {
+                        getExportBuffer(voiceOnly)
+                    }
+                    if (samples.isEmpty()) return@withContext null
+                    val rawBase = (record?.title ?: _uiState.value.projectTitle).ifBlank { "voxa_studio_audio" }
+                    val baseName = if (voiceOnly) "${rawBase}_voix_seule" else rawBase
+                    AudioExporter.createShareIntent(
+                        context = appContext,
+                        samples = samples,
+                        format = format,
+                        baseName = baseName
+                    )
+                }
+                if (intent == null) {
+                    _toastEvents.tryEmit(StudioToastEvent.Info("Aucun audio disponible pour le partage."))
+                } else {
+                    onIntentReady(intent)
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(errorMessage = "Impossible de préparer le partage : ${e.localizedMessage}") }
             }
         }
     }
@@ -1346,6 +1735,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 selectedModelId = settings.defaultModelId,
                 selectedLanguage = LanguageOption.fromCode(settings.defaultLanguageCode),
                 projects = it.projects,
+                allGenerations = it.allGenerations,
                 dictionary = it.dictionary,
                 customAmbiences = it.customAmbiences,
                 recentTones = it.recentTones,
@@ -1534,7 +1924,31 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
     fun savePersonalGeminiApiKey(rawKey: String) {
         val cleaned = rawKey.trim()
         viewModelScope.launch {
-            settingsStore.updateSettings { it.copy(personalGeminiApiKey = cleaned) }
+            settingsStore.updateSettings { current ->
+                val updatedPool = if (cleaned.isEmpty()) {
+                    emptyList()
+                } else {
+                    val existingIdx = current.apiKeyPool.indexOfFirst { it.apiKey.trim() == cleaned }
+                    if (existingIdx >= 0) {
+                        current.apiKeyPool.mapIndexed { idx, entry ->
+                            if (idx == existingIdx) entry.copy(enabled = true) else entry
+                        }
+                    } else {
+                        listOf(
+                            ApiKeyEntry(
+                                id = UUID.randomUUID().toString(),
+                                label = "Clé #${current.apiKeyPool.size + 1}",
+                                apiKey = cleaned,
+                                enabled = true
+                            )
+                        ) + current.apiKeyPool
+                    }
+                }
+                current.copy(
+                    personalGeminiApiKey = cleaned,
+                    apiKeyPool = updatedPool
+                )
+            }
             _uiState.update {
                 it.copy(
                     errorMessage = null,
@@ -1561,6 +1975,240 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                 )
             )
         }
+    }
+
+    fun addApiKeyToPool(label: String, rawKey: String) {
+        val cleanKey = rawKey.trim().trim('"', '\'')
+        if (cleanKey.isEmpty()) {
+            _uiState.update {
+                it.copy(
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        isSuccess = false,
+                        message = "Collez une clé API Gemini (AIza…) avant de l'ajouter."
+                    )
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            var wasDuplicate = false
+            settingsStore.updateSettings { current ->
+                val existing = current.apiKeyPool.firstOrNull { it.apiKey.trim() == cleanKey }
+                val updatedPool = if (existing != null) {
+                    wasDuplicate = true
+                    current.apiKeyPool.map { entry ->
+                        if (entry.id == existing.id) {
+                            entry.copy(
+                                label = label.trim().ifBlank { entry.label },
+                                enabled = true
+                            )
+                        } else entry
+                    }
+                } else {
+                    val autoLabel = label.trim().ifBlank { "Clé #${current.apiKeyPool.size + 1}" }
+                    current.apiKeyPool + ApiKeyEntry(
+                        id = UUID.randomUUID().toString(),
+                        label = autoLabel,
+                        apiKey = cleanKey,
+                        enabled = true
+                    )
+                }
+                val firstActive = updatedPool.firstOrNull { it.enabled }?.apiKey ?: updatedPool.firstOrNull()?.apiKey.orEmpty()
+                current.copy(
+                    personalGeminiApiKey = firstActive,
+                    apiKeyPool = updatedPool
+                )
+            }
+            ApiPoolCoordinator.markSuccess(cleanKey)
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    voicePreviewError = null,
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        isSuccess = true,
+                        message = if (wasDuplicate) "Clé déjà présente : réactivée dans le pool."
+                        else "Clé ajoutée au pool multi-API."
+                    )
+                )
+            }
+        }
+    }
+
+    fun importApiKeysBatch(rawText: String) {
+        val candidates = rawText
+            .split(Regex("[\\s,;]+"))
+            .map { it.trim().trim('"', '\'', '[', ']') }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (candidates.isEmpty()) {
+            _toastEvents.tryEmit(StudioToastEvent.Info("Aucune clé détectée dans le texte saisi."))
+            return
+        }
+        viewModelScope.launch {
+            var addedCount = 0
+            settingsStore.updateSettings { current ->
+                val existingSet = current.apiKeyPool.map { it.apiKey.trim() }.toSet()
+                val newKeys = candidates.filter { it !in existingSet }
+                addedCount = newKeys.size
+                if (newKeys.isEmpty()) return@updateSettings current
+
+                var indexOffset = current.apiKeyPool.size
+                val additions = newKeys.map { k ->
+                    indexOffset += 1
+                    ApiKeyEntry(
+                        id = UUID.randomUUID().toString(),
+                        label = "Clé #$indexOffset",
+                        apiKey = k,
+                        enabled = true
+                    )
+                }
+                val updatedPool = current.apiKeyPool + additions
+                val firstActive = updatedPool.firstOrNull { it.enabled }?.apiKey.orEmpty()
+                current.copy(
+                    personalGeminiApiKey = firstActive,
+                    apiKeyPool = updatedPool
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    voicePreviewError = null,
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        isSuccess = addedCount > 0,
+                        message = if (addedCount > 0) "$addedCount clé(s) importée(s) dans le pool."
+                        else "Toutes ces clés étaient déjà dans votre pool."
+                    )
+                )
+            }
+        }
+    }
+
+    fun toggleApiKeyEnabled(id: String, enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.updateSettings { current ->
+                val updatedPool = current.apiKeyPool.map { entry ->
+                    if (entry.id == id) entry.copy(enabled = enabled) else entry
+                }
+                val firstActive = updatedPool.firstOrNull { it.enabled }?.apiKey.orEmpty()
+                current.copy(
+                    personalGeminiApiKey = firstActive,
+                    apiKeyPool = updatedPool
+                )
+            }
+        }
+    }
+
+    fun removeApiKeyFromPool(id: String) {
+        viewModelScope.launch {
+            settingsStore.updateSettings { current ->
+                val updatedPool = current.apiKeyPool.filterNot { it.id == id }
+                val firstActive = updatedPool.firstOrNull { it.enabled }?.apiKey
+                    ?: updatedPool.firstOrNull()?.apiKey.orEmpty()
+                current.copy(
+                    personalGeminiApiKey = firstActive,
+                    apiKeyPool = updatedPool
+                )
+            }
+            _toastEvents.tryEmit(StudioToastEvent.Info("Clé retirée du pool."))
+        }
+    }
+
+    fun testSinglePoolKey(id: String) {
+        val entry = _uiState.value.settings.apiKeyPool.firstOrNull { it.id == id } ?: return
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = true,
+                        testingEntryId = id,
+                        isSuccess = null,
+                        message = "Vérification de ${entry.label}…"
+                    )
+                )
+            }
+            val res = aiService.verifyPersonalApiKey(entry.apiKey)
+            val ok = res.isSuccess
+            val statusMsg = res.fold(
+                onSuccess = { it },
+                onFailure = { it.message ?: "Clé invalide" }
+            )
+            settingsStore.updateSettings { current ->
+                current.copy(
+                    apiKeyPool = current.apiKeyPool.map { item ->
+                        if (item.id == id) {
+                            item.copy(lastStatusOk = ok, lastStatusMessage = statusMsg)
+                        } else item
+                    }
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        testingEntryId = null,
+                        isSuccess = ok,
+                        message = "${entry.label} : $statusMsg"
+                    )
+                )
+            }
+        }
+    }
+
+    fun testAllPoolKeys() {
+        val pool = _uiState.value.settings.apiKeyPool
+        if (pool.isEmpty()) {
+            _uiState.update {
+                it.copy(
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        isSuccess = false,
+                        message = "Ajoutez au moins une clé API dans le pool avant de lancer le test."
+                    )
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = true,
+                        isSuccess = null,
+                        message = "Test parallèle de ${pool.size} clé(s) en cours…"
+                    )
+                )
+            }
+            val testedPool = aiService.verifyApiKeyPool(pool)
+            val validCount = testedPool.count { it.lastStatusOk == true }
+            settingsStore.updateSettings { current ->
+                val byId = testedPool.associateBy { it.id }
+                current.copy(
+                    apiKeyPool = current.apiKeyPool.map { byId[it.id] ?: it }
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    apiKeyTestState = ApiKeyTestState(
+                        isTesting = false,
+                        isSuccess = validCount > 0,
+                        message = "$validCount/${testedPool.size} clé(s) valide(s) dans le pool."
+                    )
+                )
+            }
+        }
+    }
+
+    fun setApiPoolStrategy(strategy: ApiPoolStrategy) {
+        updateSettings { it.copy(apiPoolStrategy = strategy) }
+    }
+
+    fun setModelFallbackOnQuota(enabled: Boolean) {
+        updateSettings { it.copy(modelFallbackOnQuota = enabled) }
     }
 
     fun testPersonalGeminiApiKey(rawKey: String) {
@@ -1590,7 +2238,29 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
             val result = aiService.verifyPersonalApiKey(cleaned)
             result.fold(
                 onSuccess = { okMsg ->
-                    settingsStore.updateSettings { it.copy(personalGeminiApiKey = cleaned) }
+                    settingsStore.updateSettings { current ->
+                        val exists = current.apiKeyPool.any { it.apiKey.trim() == cleaned }
+                        val updatedPool = if (exists) {
+                            current.apiKeyPool.map { item ->
+                                if (item.apiKey.trim() == cleaned) {
+                                    item.copy(enabled = true, lastStatusOk = true, lastStatusMessage = okMsg)
+                                } else item
+                            }
+                        } else {
+                            current.apiKeyPool + ApiKeyEntry(
+                                id = UUID.randomUUID().toString(),
+                                label = "Clé #${current.apiKeyPool.size + 1}",
+                                apiKey = cleaned,
+                                enabled = true,
+                                lastStatusOk = true,
+                                lastStatusMessage = okMsg
+                            )
+                        }
+                        current.copy(
+                            personalGeminiApiKey = current.personalGeminiApiKey.ifBlank { cleaned },
+                            apiKeyPool = updatedPool
+                        )
+                    }
                     _uiState.update {
                         it.copy(
                             errorMessage = null,
@@ -1598,7 +2268,7 @@ class VoxaStudioViewModel(application: Application) : AndroidViewModel(applicati
                             apiKeyTestState = ApiKeyTestState(
                                 isTesting = false,
                                 isSuccess = true,
-                                message = "$okMsg Clé enregistrée et activée."
+                                message = "$okMsg Clé ajoutée et activée dans le pool."
                             )
                         )
                     }
